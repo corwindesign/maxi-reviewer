@@ -88,6 +88,25 @@ describe("renderReport", () => {
     expect(out).toContain("| reviewer |");
   });
 
+  it("stays a valid table when no path group qualifies for a column", () => {
+    // Reachable on a short window or a new org: every group can sit under
+    // MIN_GROUP_SAMPLES while `overall` still has plenty of findings.
+    // Interpolating an empty `groups.join()` between fixed columns left a
+    // trailing empty cell, making the header one column wider than its
+    // separator -- which renders as a broken table, not a narrow one.
+    const p = profiles({
+      coderabbitai: { docs: stats(MIN_GROUP_SAMPLES - 1, 0.8) },
+    });
+    const out = renderReport(p);
+    const rows = out
+      .split("\n")
+      .filter((l) => l.startsWith("| ") && l.endsWith(" |"));
+    expect(rows.length).toBeGreaterThan(2);
+    const widths = new Set(rows.map((r) => r.split("|").length));
+    expect(widths.size, `ragged table: ${[...widths].join(", ")}`).toBe(1);
+    expect(out).not.toContain("|  |");
+  });
+
   it("says plainly that columns are not comparable to each other", () => {
     // The trap the first hand-reading fell into: `rust-src` outscored `docs`
     // for nearly every reviewer, which reads as a quality ranking and is

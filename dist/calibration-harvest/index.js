@@ -71843,12 +71843,23 @@ function renderReport(profiles) {
     lines.push("");
     lines.push("Rates are *not* comparable across columns — a wider path bucket catches more incidental commits. Compare reviewers **down** a column; that is what the roster routes on.");
     lines.push("");
-    lines.push(`| reviewer | overall | ${groups.join(" | ")} |`);
-    lines.push(`| --- | ---: | ${groups.map(() => "---:").join(" | ")} |`);
+    // Built as one array per row rather than interpolating `groups.join()`
+    // between fixed columns. With no qualifying group the interpolation left a
+    // trailing empty cell -- `| reviewer | overall |  |` -- and a header one
+    // column wider than its separator renders as a broken table rather than a
+    // narrow one. That is reachable: a short window, or a new org, can leave
+    // every path group under MIN_GROUP_SAMPLES. (codacy)
+    const header = ["reviewer", "overall", ...groups];
+    lines.push(`| ${header.join(" | ")} |`);
+    lines.push(`| ${header.map((_, i) => (i === 0 ? "---" : "---:")).join(" | ")} |`);
     for (const name of names) {
         const stats = profiles.reviewers[name];
-        const cells = groups.map((g) => rateCell(stats.byPathGroup[g]));
-        lines.push(`| ${name} | ${rateCell(stats.overall)} | ${cells.join(" | ")} |`);
+        const row = [
+            name,
+            rateCell(stats.overall),
+            ...groups.map((g) => rateCell(stats.byPathGroup[g])),
+        ];
+        lines.push(`| ${row.join(" | ")} |`);
     }
     lines.push("");
     const gaps = spreads(profiles);

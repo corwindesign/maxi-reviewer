@@ -146,14 +146,25 @@ export function renderReport(profiles: ReviewerProfiles): string {
   );
   lines.push("");
 
-  lines.push(`| reviewer | overall | ${groups.join(" | ")} |`);
-  lines.push(`| --- | ---: | ${groups.map(() => "---:").join(" | ")} |`);
+  // Built as one array per row rather than interpolating `groups.join()`
+  // between fixed columns. With no qualifying group the interpolation left a
+  // trailing empty cell -- `| reviewer | overall |  |` -- and a header one
+  // column wider than its separator renders as a broken table rather than a
+  // narrow one. That is reachable: a short window, or a new org, can leave
+  // every path group under MIN_GROUP_SAMPLES. (codacy)
+  const header = ["reviewer", "overall", ...groups];
+  lines.push(`| ${header.join(" | ")} |`);
+  lines.push(
+    `| ${header.map((_, i) => (i === 0 ? "---" : "---:")).join(" | ")} |`
+  );
   for (const name of names) {
     const stats = profiles.reviewers[name as keyof typeof profiles.reviewers];
-    const cells = groups.map((g) => rateCell(stats.byPathGroup[g]));
-    lines.push(
-      `| ${name} | ${rateCell(stats.overall)} | ${cells.join(" | ")} |`
-    );
+    const row = [
+      name,
+      rateCell(stats.overall),
+      ...groups.map((g) => rateCell(stats.byPathGroup[g])),
+    ];
+    lines.push(`| ${row.join(" | ")} |`);
   }
   lines.push("");
 
