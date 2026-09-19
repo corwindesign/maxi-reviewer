@@ -355,6 +355,47 @@ export interface CommitWalk {
 }
 
 /**
+ * Every changed path on one commit, following the REST pagination.
+ *
+ * `repos.getCommit` returns at most 300 files in a single response and puts
+ * the rest behind `Link: rel="next"`. Reading only the first page and then
+ * calling the result known records an incomplete page as a complete record:
+ * a bot comment on a file that landed on page two classifies as `dismissed`
+ * rather than `accepted` — the same "partial result published as data" that
+ * #133 is about, one API boundary further down.
+ *
+ * Returns `known: false` when the page limit is reached on a full page,
+ * i.e. more files exist than this is willing to read. Extracted from
+ * `listCommitsAfter` so the paging has its own seam: it is the part that
+ * carried the bug, so it is the part worth being able to test alone.
+ */
+export async function listCommitFiles(
+  octokit: ReturnType<typeof github.getOctokit>,
+  pull: PullRef,
+  oid: string
+): Promise<{ paths: string[]; known: boolean }> {
+  const paths: string[] = [];
+  for (let page = 1; page <= COMMIT_FILE_PAGE_LIMIT; page += 1) {
+    const { data } = await octokit.rest.repos.getCommit({
+      owner: pull.owner,
+      repo: pull.repo,
+      ref: oid,
+      per_page: COMMIT_FILE_PAGE_SIZE,
+      page,
+    });
+    const files = data.files ?? [];
+    for (const f of files) paths.push(f.filename);
+    if (files.length < COMMIT_FILE_PAGE_SIZE) return { paths, known: true };
+  }
+  // Fell out of the loop on a full page: more files exist than we read.
+  core.warning(
+    `harvest: commit ${oid.slice(0, 8)} on ${pull.owner}/${pull.repo}#${pull.number} has more than ` +
+      `${COMMIT_FILE_PAGE_LIMIT * COMMIT_FILE_PAGE_SIZE} changed files; its path list is truncated`
+  );
+  return { paths, known: false };
+}
+
+/**
  * Walk the commits on this PR, returning `{oid, committedDate, paths}` in
  * reverse-chronological order.
  *
@@ -459,38 +500,9 @@ export async function listCommitsAfter(
       continue;
     }
     try {
-      // PAGINATE. `repos.getCommit` returns at most 300 files in one
-      // response and puts the rest behind `Link: rel="next"`. Reading only
-      // the first page and then setting `pathsKnown: true` records an
-      // incomplete page as a complete record: a bot comment on a file that
-      // landed on page two classifies as `dismissed` rather than
-      // `accepted` — the same "partial result published as data" that #133
-      // is about, one API boundary further down.
-      const paths: string[] = [];
-      let filesKnown = true;
-      for (let page = 1; page <= COMMIT_FILE_PAGE_LIMIT; page += 1) {
-        const { data } = await octokit.rest.repos.getCommit({
-          owner: pull.owner,
-          repo: pull.repo,
-          ref: entry.oid,
-          per_page: COMMIT_FILE_PAGE_SIZE,
-          page,
-        });
-        const files = data.files ?? [];
-        for (const f of files) paths.push(f.filename);
-        if (files.length < COMMIT_FILE_PAGE_SIZE) break;
-        if (page === COMMIT_FILE_PAGE_LIMIT) {
-          // A full last page means more files exist than we are willing to
-          // read. Say so rather than treating the prefix as the whole diff.
-          filesKnown = false;
-          complete = false;
-          core.warning(
-            `harvest: commit ${entry.oid.slice(0, 8)} on ${pull.owner}/${pull.repo}#${pull.number} has more than ` +
-              `${COMMIT_FILE_PAGE_LIMIT * COMMIT_FILE_PAGE_SIZE} changed files; its path list is truncated`
-          );
-        }
-      }
-      commits.push({ ...entry, paths, pathsKnown: filesKnown });
+      const { paths, known } = await listCommitFiles(octokit, pull, entry.oid);
+      if (!known) complete = false;
+      commits.push({ ...entry, paths, pathsKnown: known });
       touchedPaths += paths.length;
     } catch (err) {
       // One unreachable commit must not silently become "touched nothing".
