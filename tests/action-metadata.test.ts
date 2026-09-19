@@ -92,9 +92,23 @@ describe("action metadata", () => {
     expect(shared, `shared concurrency group(s): ${shared.join(", ")}`).toEqual(
       []
     );
-    // Both must still be per-PR, or one PR's run would evict another's.
-    expect(selfTest.join(" ")).toContain("github.event.pull_request.number");
-    expect(maxiReview.join(" ")).toContain("github.event.pull_request.number");
+    // EVERY group, not the concatenation. `groupsOf` returns all of them and
+    // `join(" ")` then let a single per-PR group vouch for the rest: add one
+    // constant group beside it and the assertion still passed, while that
+    // group shared a slot across pull requests and -- with
+    // cancel-in-progress on -- cancelled somebody else's run. Checking one
+    // lock does not prove every door is locked, and reporting the subset as
+    // the whole is the defect this PR exists to remove.
+    const isPerPullRequest = (group: string) =>
+      group.includes("github.event.pull_request.number");
+    expect(
+      selfTest.filter((g) => !isPerPullRequest(g)),
+      "self-test.yml declares a concurrency group that is not per-PR"
+    ).toEqual([]);
+    expect(
+      maxiReview.filter((g) => !isPerPullRequest(g)),
+      "maxi-review.yml declares a concurrency group that is not per-PR"
+    ).toEqual([]);
   });
 
   it("builds the local action before dogfooding it", () => {
