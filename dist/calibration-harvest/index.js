@@ -71395,13 +71395,11 @@ async function harvest(octokit, org, windowDays, options = {}) {
         // the walk on an unresolved thread made `accepted` unreachable for
         // nearly every merged PR. That is what produced a 0% accept rate across
         // all seven reviewers over a 270-PR window.
-        {
-            try {
-                commits = await listCommitsAfter(octokit, pull, maxTouchedPathsPerPull, maxCommitsPerPull);
-            }
-            catch (err) {
-                warning(`harvest: commits fetch failed for ${pull.owner}/${pull.repo}#${pull.number}: ${String(err)}`);
-            }
+        try {
+            commits = await listCommitsAfter(octokit, pull, maxTouchedPathsPerPull, maxCommitsPerPull);
+        }
+        catch (err) {
+            warning(`harvest: commits fetch failed for ${pull.owner}/${pull.repo}#${pull.number}: ${String(err)}`);
         }
         function touchedPathsAfterThread(thread) {
             if (!thread.createdAt)

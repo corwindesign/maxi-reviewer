@@ -429,7 +429,7 @@ describe("harvest", () => {
     expect(result.artifactsObserved).toBe(0);
   });
 
-  it("classifies a resolved thread with a later commit on the file as accepted", async () => {
+  it("counts a resolved thread with a later commit as accepted", async () => {
     // Regression: `accepted` was structurally unreachable on any PR whose bot
     // threads were ALL resolved. The commit walk was gated on
     // `botThreads.some((t) => !t.isResolved)`, so a fully-resolved PR never
