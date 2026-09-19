@@ -14,7 +14,7 @@ import {
   harvest,
   listPullsInWindow,
   listReviewThreads,
-  listChangedPathsAfter,
+  listCommitsAfter,
   runScheduledHarvest,
 } from "../src/reviewer-profile-build.js";
 import { buildCalibrationReport } from "../src/calibration.js";
@@ -174,29 +174,33 @@ describe("listReviewThreads", () => {
   });
 });
 
-describe("listChangedPathsAfter", () => {
-  it("returns the set of paths touched after the cutoff", async () => {
+describe("listCommitsAfter", () => {
+  it("returns the commit list with paths in reverse-chronological order", async () => {
     const octokit = makeOctokit({
-      '["cursor","expr","first","name","owner"]': () => ({
+      '["cursor","first","name","owner","pr"]': () => ({
         repository: {
-          object: {
-            history: {
+          pullRequest: {
+            commits: {
               pageInfo: { hasNextPage: false, endCursor: null },
               nodes: [
                 {
-                  oid: "a",
-                  authoredDate: "2026-09-10T00:00:00Z",
-                  committedDate: "2026-09-10T00:00:00Z",
-                  changedFiles: {
-                    nodes: [{ path: "src/a.ts" }, { path: "src/b.ts" }],
+                  commit: {
+                    oid: "a",
+                    authoredDate: "2026-09-10T00:00:00Z",
+                    committedDate: "2026-09-10T00:00:00Z",
+                    changedFilesIfAvailable: {
+                      nodes: [{ path: "src/a.ts" }, { path: "src/b.ts" }],
+                    },
                   },
                 },
                 {
-                  oid: "b",
-                  authoredDate: "2026-09-09T23:59:00Z",
-                  committedDate: "2026-09-09T23:59:00Z",
-                  changedFiles: {
-                    nodes: [{ path: "src/early.ts" }],
+                  commit: {
+                    oid: "b",
+                    authoredDate: "2026-09-09T23:59:00Z",
+                    committedDate: "2026-09-09T23:59:00Z",
+                    changedFilesIfAvailable: {
+                      nodes: [{ path: "src/early.ts" }],
+                    },
                   },
                 },
               ],
@@ -205,7 +209,7 @@ describe("listChangedPathsAfter", () => {
         },
       }),
     });
-    const paths = await listChangedPathsAfter(
+    const commits = await listCommitsAfter(
       octokit as never,
       {
         owner: "maxi-tools",
@@ -214,13 +218,13 @@ describe("listChangedPathsAfter", () => {
         terminusAt: "2026-09-10T01:00:00Z",
         updatedAt: "2026-09-10T01:00:00Z",
       },
-      "2026-09-10T00:00:00Z",
       2000,
       200
     );
-    expect(paths.has("src/a.ts")).toBe(true);
-    expect(paths.has("src/b.ts")).toBe(true);
-    expect(paths.has("src/early.ts")).toBe(false);
+    // The list is reverse-chronological by GitHub's contract; commit "a"
+    // (newer) appears before "b" (older).
+    expect(commits.map((c) => c.oid)).toEqual(["a", "b"]);
+    expect(commits[0].paths).toContain("src/a.ts");
   });
 });
 
@@ -420,25 +424,27 @@ describe("harvest", () => {
   });
 });
 
-describe("listChangedPathsAfter pagination", () => {
+describe("listCommitsAfter pagination", () => {
   it("walks multiple history pages and stops when the path set is full", async () => {
     let pages = 0;
     const octokit = makeOctokit({
-      '["cursor","expr","first","name","owner"]': () => {
+      '["cursor","first","name","owner","pr"]': () => {
         pages += 1;
         if (pages === 1) {
           return {
             repository: {
-              object: {
-                history: {
+              pullRequest: {
+                commits: {
                   pageInfo: { hasNextPage: true, endCursor: "c2" },
                   nodes: [
                     {
-                      oid: "a",
-                      authoredDate: "2026-09-10T00:30:00Z",
-                      committedDate: "2026-09-10T00:30:00Z",
-                      changedFiles: {
-                        nodes: [{ path: "src/a.ts" }, { path: "src/b.ts" }],
+                      commit: {
+                        oid: "a",
+                        authoredDate: "2026-09-10T00:30:00Z",
+                        committedDate: "2026-09-10T00:30:00Z",
+                        changedFilesIfAvailable: {
+                          nodes: [{ path: "src/a.ts" }, { path: "src/b.ts" }],
+                        },
                       },
                     },
                   ],
@@ -449,16 +455,18 @@ describe("listChangedPathsAfter pagination", () => {
         }
         return {
           repository: {
-            object: {
-              history: {
+            pullRequest: {
+              commits: {
                 pageInfo: { hasNextPage: false, endCursor: null },
                 nodes: [
                   {
-                    oid: "b",
-                    authoredDate: "2026-09-10T00:31:00Z",
-                    committedDate: "2026-09-10T00:31:00Z",
-                    changedFiles: {
-                      nodes: [{ path: "src/c.ts" }],
+                    commit: {
+                      oid: "b",
+                      authoredDate: "2026-09-10T00:31:00Z",
+                      committedDate: "2026-09-10T00:31:00Z",
+                      changedFilesIfAvailable: {
+                        nodes: [{ path: "src/c.ts" }],
+                      },
                     },
                   },
                 ],
@@ -468,7 +476,7 @@ describe("listChangedPathsAfter pagination", () => {
         };
       },
     });
-    const paths = await listChangedPathsAfter(
+    const commits = await listCommitsAfter(
       octokit as never,
       {
         owner: "maxi-tools",
@@ -477,30 +485,31 @@ describe("listChangedPathsAfter pagination", () => {
         terminusAt: "2026-09-10T01:00:00Z",
         updatedAt: "2026-09-10T01:00:00Z",
       },
-      "2026-09-10T00:00:00Z",
       2000,
       200
     );
-    expect(paths.has("src/a.ts")).toBe(true);
-    expect(paths.has("src/b.ts")).toBe(true);
-    expect(paths.has("src/c.ts")).toBe(true);
+    expect(commits.map((c) => c.paths).flat()).toEqual(
+      expect.arrayContaining(["src/a.ts", "src/b.ts", "src/c.ts"])
+    );
     expect(pages).toBe(2);
   });
 
   it("caps at the commit ceiling when a branch has unbounded history", async () => {
     const octokit = makeOctokit({
-      '["cursor","expr","first","name","owner"]': () => ({
+      '["cursor","first","name","owner","pr"]': () => ({
         repository: {
-          object: {
-            history: {
+          pullRequest: {
+            commits: {
               pageInfo: { hasNextPage: true, endCursor: "c2" },
               nodes: [
                 {
-                  oid: "a",
-                  authoredDate: "2026-09-10T00:30:00Z",
-                  committedDate: "2026-09-10T00:30:00Z",
-                  changedFiles: {
-                    nodes: [{ path: "src/a.ts" }],
+                  commit: {
+                    oid: "a",
+                    authoredDate: "2026-09-10T00:30:00Z",
+                    committedDate: "2026-09-10T00:30:00Z",
+                    changedFilesIfAvailable: {
+                      nodes: [{ path: "src/a.ts" }],
+                    },
                   },
                 },
               ],
@@ -509,7 +518,7 @@ describe("listChangedPathsAfter pagination", () => {
         },
       }),
     });
-    const paths = await listChangedPathsAfter(
+    const commits = await listCommitsAfter(
       octokit as never,
       {
         owner: "maxi-tools",
@@ -518,12 +527,10 @@ describe("listChangedPathsAfter pagination", () => {
         terminusAt: "2026-09-10T01:00:00Z",
         updatedAt: "2026-09-10T01:00:00Z",
       },
-      "2026-09-10T00:00:00Z",
       2000,
-      // Hit the commit ceiling before paginating further.
       1
     );
-    expect(paths.has("src/a.ts")).toBe(true);
+    expect(commits[0]?.paths).toContain("src/a.ts");
   });
 });
 

@@ -87,14 +87,15 @@ jobs:
             } >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Mint a token with org-wide metadata:read
+      - name: Mint a token with org-wide issues:read
         id: app-token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           client-id: ${{ secrets.APP_CLIENT_ID }}
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          # No `repositories:` line — the App token inherits the org-wide
+          # installation's grant, which is what the cross-repo search needs.
           owner: maxi-tools
-          repositories: ${{ github.event.repository.name }}
           permission-contents: read
           permission-issues: read
           permission-pull-requests: read
@@ -137,6 +138,8 @@ jobs:
         # a malformed file would silently produce an empty routing table. The
         # smoke check is a Node one-liner so the workflow doesn't depend on jq
         # or python in PATH.
+        env:
+          REVIEWER_PROFILES_PATH: ${{ steps.run.outputs.profiles-path }}
         run: |
           node -e '
             const path = process.env.REVIEWER_PROFILES_PATH;

@@ -8,7 +8,7 @@
  *
  * Entry points:
  *   - runScheduledHarvest(): used by .github/workflows/calibration-harvest.yml.
- *   - collectFindings(...): the harvester itself, exposed for tests.
+ *   - harvest(...): the harvester itself, exposed for tests.
  *   - listPullsInWindow / listReviewThreads / listChangedPathsAfter: the
  *     three paginated GraphQL walks the harvester composes.
  */
@@ -68,17 +68,19 @@ interface GraphqlThreadPage {
 
 interface GraphqlCommitPathsPage {
   repository: {
-    object: {
-      history: {
+    pullRequest: {
+      commits: {
         pageInfo: { hasNextPage: boolean; endCursor: string | null };
         nodes: Array<{
-          oid: string;
-          authoredDate: string;
-          committedDate: string;
-          changedFiles: { nodes: Array<{ path: string }> } | null;
+          commit: {
+            oid: string;
+            authoredDate: string;
+            committedDate: string;
+            changedFilesIfAvailable: { nodes: Array<{ path: string }> } | null;
+          };
         }>;
       };
-    } | null;
+    };
   } | null;
 }
 
@@ -146,23 +148,23 @@ const COMMIT_PATHS_QUERY = /* GraphQL */ `
   query HarvestCommitPaths(
     $owner: String!
     $name: String!
-    $expr: String!
+    $pr: Int!
     $first: Int!
     $cursor: String
   ) {
     repository(owner: $owner, name: $name) {
-      object(expression: $expr) {
-        ... on Commit {
-          history(first: $first, after: $cursor) {
-            pageInfo {
-              hasNextPage
-              endCursor
-            }
-            nodes {
+      pullRequest(number: $pr) {
+        commits(first: $first, after: $cursor) {
+          pageInfo {
+            hasNextPage
+            endCursor
+          }
+          nodes {
+            commit {
               oid
               authoredDate
               committedDate
-              changedFiles(first: 100) {
+              changedFilesIfAvailable(first: 100) {
                 nodes {
                   path
                 }
@@ -218,7 +220,11 @@ async function paginate<
 /**
  * Walk the org's merged/closed pull requests in the trailing window. The
  * search query narrows on `is:pr` and the merge/close date so we don't
- * enumerate every open PR in the org just to filter server-side.
+ * enumerate every open PR in the org just to filter server-side. The
+ * OR clause is parenthesised — GitHub's search applies `OR` with lower
+ * precedence than the implicit AND, so `a OR b sort:updated-desc` would
+ * otherwise read as `(a) OR (b sort:updated-desc)` and pull the entire
+ * platform's issues into scope.
  */
 export async function listPullsInWindow(
   octokit: ReturnType<typeof github.getOctokit>,
@@ -229,7 +235,7 @@ export async function listPullsInWindow(
   const date = new Date(Date.now() - windowDays * 24 * 60 * 60 * 1000)
     .toISOString()
     .slice(0, 10);
-  const query = `org:${org} is:pr is:closed merged:>=${date} OR closed:>=${date} sort:updated-desc`;
+  const query = `org:${org} is:pr is:closed (merged:>=${date} OR closed:>=${date}) sort:updated-desc`;
 
   const pulls = await paginate(
     async (cursor) => {
@@ -305,46 +311,59 @@ export async function listReviewThreads(
 }
 
 /**
- * Walk the commits on this PR's head branch up to the terminus, returning the
- * set of file paths touched after `sinceIso`. The history connection doesn't
- * accept a `since:` argument, so we filter by `committedDate` client-side and
- * cap the result so a noisy branch can't run the harvester out of memory.
+ * Walk the commits on this PR, returning a per-PR list of `{oid,
+ * committedDate, paths}` in reverse-chronological order. The list is
+ * capped by `maxCommits` and `maxTouchedPaths` so a noisy branch can't run
+ * the harvester out of memory.
+ *
+ * The PR's `commits` connection is used (not `repository.object`) because
+ * `object(expression:)` requires a git ref (SHA, branch, or tag) — passing
+ * an ISO timestamp silently returns null, which would surface as an empty
+ * changed-files set on every PR. The commits connection doesn't accept a
+ * date filter; instead, callers stop walking once a commit's date falls
+ * before their per-thread `createdAt`.
  */
-export async function listChangedPathsAfter(
+export async function listCommitsAfter(
   octokit: ReturnType<typeof github.getOctokit>,
   pull: PullRef,
-  sinceIso: string,
   maxTouchedPaths: number,
   maxCommits: number
-): Promise<Set<string>> {
-  const paths = new Set<string>();
+): Promise<Array<{ oid: string; committedDate: string; paths: string[] }>> {
+  const commits: Array<{
+    oid: string;
+    committedDate: string;
+    paths: string[];
+  }> = [];
   let cursor: string | null = null;
-  let commitsInspected = 0;
-  while (paths.size < maxTouchedPaths && commitsInspected < maxCommits) {
+  let touchedPaths = 0;
+  while (commits.length < maxCommits && touchedPaths < maxTouchedPaths) {
     const response = (await octokit.graphql(COMMIT_PATHS_QUERY, {
       owner: pull.owner,
       name: pull.repo,
-      expr: `${pull.terminusAt}^`,
+      pr: pull.number,
       first: 50,
       cursor,
     })) as GraphqlCommitPathsPage;
-    const conn = response.repository?.object?.history;
+    const conn = response.repository?.pullRequest?.commits;
     if (!conn) break;
-    for (const commit of conn.nodes) {
-      commitsInspected += 1;
-      if (commit.committedDate < sinceIso) continue;
-      for (const file of commit.changedFiles?.nodes ?? []) {
-        paths.add(file.path);
-        if (paths.size >= maxTouchedPaths) break;
-      }
-      if (paths.size >= maxTouchedPaths) break;
-      if (commitsInspected >= maxCommits) break;
+    for (const node of conn.nodes) {
+      const paths = (node.commit.changedFilesIfAvailable?.nodes ?? []).map(
+        (f) => f.path
+      );
+      commits.push({
+        oid: node.commit.oid,
+        committedDate: node.commit.committedDate,
+        paths,
+      });
+      touchedPaths += paths.length;
+      if (commits.length >= maxCommits) break;
+      if (touchedPaths >= maxTouchedPaths) break;
     }
     if (!conn.pageInfo.hasNextPage) break;
     cursor = conn.pageInfo.endCursor;
     if (cursor === null) break;
   }
-  return paths;
+  return commits;
 }
 
 export interface HarvestResult {
@@ -362,6 +381,11 @@ export interface HarvestResult {
  * `maxi.review.v1.review-artifact` payloads from each PR so the existing
  * `calibration.ts` engine produces a per-rule / per-severity / per-path report
  * for maxi-reviewer.
+ *
+ * The touched-paths set for each finding is filtered by that thread's own
+ * `createdAt`. Using a single PR-wide earliest date (as the original draft
+ * did) risked marking threads accepted by commits that landed before the
+ * thread was opened.
  */
 export async function harvest(
   octokit: ReturnType<typeof github.getOctokit>,
@@ -404,21 +428,19 @@ export async function harvest(
       `harvest: PR ${pullIndex}/${pulls.length} ${pull.owner}/${pull.repo}#${pull.number}: ${botThreads.length} bot threads`
     );
 
-    // Touched-paths set: only meaningful when there is at least one still-
-    // open bot thread (a resolved thread is classified by the resolved flag
-    // alone; we still want a touch set for the open ones).
-    const earliestOpenThread = botThreads
-      .filter((t) => !t.isResolved)
-      .map((t) => t.createdAt)
-      .filter((s): s is string => Boolean(s))
-      .sort()[0];
-    let touchedPaths = new Set<string>();
-    if (earliestOpenThread) {
+    // Walk the PR's commits once. The list is reverse-chronological;
+    // for each thread, accumulate the paths touched after its createdAt
+    // by stopping the per-thread filter when we hit an older commit.
+    let commits: Array<{
+      oid: string;
+      committedDate: string;
+      paths: string[];
+    }> = [];
+    if (botThreads.some((t) => !t.isResolved)) {
       try {
-        touchedPaths = await listChangedPathsAfter(
+        commits = await listCommitsAfter(
           octokit,
           pull,
-          earliestOpenThread,
           maxTouchedPathsPerPull,
           maxCommitsPerPull
         );
@@ -427,6 +449,20 @@ export async function harvest(
           `harvest: commits fetch failed for ${pull.owner}/${pull.repo}#${pull.number}: ${String(err)}`
         );
       }
+    }
+
+    function touchedPathsAfterThread(thread: ReviewThreadRef): string[] {
+      if (!thread.createdAt) return [];
+      const out: string[] = [];
+      // commits is reverse-chronological; once we see a commit dated
+      // before the thread, no later commit is older, so we stop walking.
+      for (const c of commits) {
+        if (c.committedDate < thread.createdAt) break;
+        for (const p of c.paths) {
+          out.push(p);
+        }
+      }
+      return out;
     }
 
     for (const thread of botThreads) {
@@ -440,7 +476,7 @@ export async function harvest(
         path,
         line: thread.line ?? 0,
         threadResolved: thread.isResolved,
-        subsequentTouchedPaths: [...touchedPaths],
+        subsequentTouchedPaths: touchedPathsAfterThread(thread),
       });
     }
 
@@ -548,8 +584,6 @@ export async function runScheduledHarvest(
       core.info(`harvest: ${reviewer}: ${summary}`);
     }
   }
-  // One harmless diagnostic line so the workflow log records the bucketer
-  // is wired to the values the README documents.
   core.info(
     `harvest: bucketer smoke-check: Cargo.lock=${pathGroupFor("Cargo.lock")} workflows/ci.yml=${pathGroupFor(".github/workflows/ci.yml")}`
   );
