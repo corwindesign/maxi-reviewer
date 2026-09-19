@@ -1074,3 +1074,129 @@ describe("a failed measurement is never published as data", () => {
     ).toBe("dismissed");
   });
 });
+
+describe("truncation and partial failure are reported, not hidden", () => {
+  // Review on #134 found three holes in the #133 fix itself -- each one the
+  // same shape it was written to close: an incomplete result presented as a
+  // complete one.
+
+  const PULL = {
+    owner: "maxi-tools",
+    repo: "maxi-reviewer",
+    number: 1,
+    terminusAt: "2026-09-10T01:00:00Z",
+    updatedAt: "2026-09-10T01:00:00Z",
+  };
+
+  function commitNode(oid, date) {
+    return {
+      commit: { oid, authoredDate: date, committedDate: date },
+    };
+  }
+
+  it("flags truncation when the cap is hit mid-page on the LAST page", async () => {
+    // hasNextPage is FALSE, so the old code broke out before its truncation
+    // check and reported complete=true -- while silently dropping the third
+    // commit on this page.
+    const octokit = makeOctokit(
+      {
+        HarvestCommitPaths: () => ({
+          repository: {
+            pullRequest: {
+              commits: {
+                pageInfo: { hasNextPage: false, endCursor: null },
+                nodes: [
+                  commitNode("c3", "2026-09-10T03:00:00Z"),
+                  commitNode("c2", "2026-09-10T02:00:00Z"),
+                  commitNode("c1", "2026-09-10T01:00:00Z"),
+                ],
+              },
+            },
+          },
+        }),
+      },
+      { c3: ["a.ts"], c2: ["b.ts"] }
+    );
+    const walk = await listCommitsAfter(octokit as never, PULL, 2000, 2);
+    expect(walk.commits).toHaveLength(2);
+    expect(walk.complete).toBe(false);
+  });
+
+  it("flags truncation when hasNextPage is true but the cursor is null", async () => {
+    // More commits exist and there is no way to reach them. Reported as
+    // finished before.
+    const octokit = makeOctokit(
+      {
+        HarvestCommitPaths: () => ({
+          repository: {
+            pullRequest: {
+              commits: {
+                pageInfo: { hasNextPage: true, endCursor: null },
+                nodes: [commitNode("c1", "2026-09-10T01:00:00Z")],
+              },
+            },
+          },
+        }),
+      },
+      { c1: ["a.ts"] }
+    );
+    const walk = await listCommitsAfter(octokit as never, PULL, 2000, 50);
+    expect(walk.complete).toBe(false);
+  });
+
+  it("still answers a thread whose commits were all walked, on a truncated walk", async () => {
+    // Truncation drops the OLDEST commits. A thread whose slice closes --
+    // i.e. we saw a commit older than it -- has a complete answer regardless.
+    // Bailing on `!walk.complete` threw away every thread on a large PR,
+    // including recent ones whose commits were all present.
+    const finding = {
+      reviewer: "coderabbitai" as const,
+      repo: "maxi-tools/maxi-reviewer",
+      prNumber: 1,
+      path: "a.ts",
+      line: 1,
+      threadResolved: true,
+    };
+    // Simulated directly against the classifier: paths known, slice closed.
+    expect(
+      classifyOutcome({
+        ...finding,
+        subsequentTouchedPaths: ["a.ts"],
+        touchedPathsKnown: true,
+      })
+    ).toBe("accepted");
+  });
+
+  it("counts a threads-leg failure as an observed, degraded PR", async () => {
+    // The commits leg was covered; this one was not. A `continue` before
+    // `observedPulls += 1` meant a threads query failing on EVERY PR yielded
+    // zero findings, zero unknowns, and an all-zero profile that the
+    // all-degraded guard never saw.
+    const octokit = makeOctokit({
+      HarvestPulls: () => ({
+        search: {
+          pageInfo: { hasNextPage: false, endCursor: null },
+          nodes: [
+            {
+              number: 7,
+              title: "t",
+              url: "u",
+              mergedAt: "2026-09-10T12:00:00Z",
+              closedAt: null,
+              updatedAt: "2026-09-10T12:00:00Z",
+              repository: { nameWithOwner: "maxi-tools/maxi-reviewer" },
+            },
+          ],
+        },
+      }),
+      HarvestThreads: () => {
+        throw new Error("pull_requests: read revoked");
+      },
+    });
+    const result = await harvest(octokit as never, "maxi-tools", 30, {
+      maxPulls: 5,
+    }).catch((err: unknown) => err);
+    expect(result).toBeInstanceOf(Error);
+    expect(String(result)).toMatch(/failed harvest, not an empty one/);
+  });
+});

@@ -402,19 +402,32 @@ export async function listCommitsAfter(
       break;
     }
     for (const node of conn.nodes) {
+      if (listed.length >= maxCommits) {
+        // Nodes remain on THIS page that we are not taking. Recorded here,
+        // before any break: the previous version only flagged truncation
+        // after the `hasNextPage` test, so hitting the cap mid-page on the
+        // LAST page dropped commits while still reporting `complete = true`.
+        complete = false;
+        break;
+      }
       listed.push({
         oid: node.commit.oid,
         committedDate: node.commit.committedDate,
       });
-      if (listed.length >= maxCommits) break;
     }
     if (!conn.pageInfo.hasNextPage) break;
     cursor = conn.pageInfo.endCursor;
-    if (cursor === null) break;
+    if (cursor === null) {
+      // `hasNextPage` with no cursor: more commits exist and there is no way
+      // to reach them. Truncated, not finished.
+      complete = false;
+      break;
+    }
     if (listed.length >= maxCommits) {
       // More commits exist than we are willing to walk. Say so rather than
       // letting a truncated list read as the whole history.
       complete = false;
+      break;
     }
   }
 
@@ -516,6 +529,13 @@ export async function harvest(
       core.warning(
         `harvest: threads fetch failed for ${pull.owner}/${pull.repo}#${pull.number}: ${String(err)}`
       );
+      // Counted as observed AND degraded. A `continue` alone incremented
+      // nothing, so a threads leg that failed on every PR -- an expired App
+      // token, a revoked `pull_requests: read` -- produced zero findings,
+      // zero unknowns, and an all-zero profile that the all-degraded guard
+      // below never saw. The commits leg had this covered; this one did not.
+      observedPulls += 1;
+      degradedPulls += 1;
       continue;
     }
 
@@ -576,18 +596,32 @@ export async function harvest(
       known: boolean;
     } {
       if (!thread.createdAt) return { paths: [], known: false };
-      if (!walk.complete) return { paths: [], known: false };
       const out: string[] = [];
       // commits is reverse-chronological; once we see a commit dated
       // before the thread, no later commit is older, so we stop walking.
       for (const c of walk.commits) {
-        if (c.committedDate < thread.createdAt) break;
+        if (c.committedDate < thread.createdAt) {
+          // The slice is CLOSED: we found a commit older than the thread, so
+          // everything after it is already in `out`. That is a complete
+          // answer for THIS thread even if the walk was truncated further
+          // back in history -- truncation drops the oldest commits, which by
+          // definition cannot be after a thread we have already passed.
+          //
+          // Bailing on `!walk.complete` up front (as this did) threw away
+          // every thread on a large PR, including recent ones whose commits
+          // were all present.
+          return { paths: out, known: true };
+        }
         if (!c.pathsKnown) return { paths: [], known: false };
         for (const p of c.paths) {
           out.push(p);
         }
       }
-      return { paths: out, known: true };
+      // Ran off the end without closing the slice. If the walk was truncated,
+      // a commit after this thread may be among the ones we never fetched.
+      return walk.complete
+        ? { paths: out, known: true }
+        : { paths: [], known: false };
     }
 
     for (const thread of botThreads) {
