@@ -135,6 +135,43 @@ describe("listPullsInWindow", () => {
     expect(Object.keys(vars)).not.toContain("query");
     expect(Object.keys(vars)).toContain("searchQuery");
   });
+
+  it("builds the searchQuery so GitHub's OR returns both merged and closed-not-merged PRs in window", async () => {
+    // Regression for the broken search-query shape that returned 0 PRs
+    // for the entire `maxi-tools` org. GitHub's `search(type: ISSUE)`
+    // requires the OR's two sides to each be parenthesised individually:
+    // `is:pr (merged:>=D) OR (closed:>=D)`. A single outer paren around
+    // the disjunction — `(merged:>=D OR closed:>=D)` — also returns 0,
+    // even though the parens balance. Assert the live shape so the next
+    // refactor that re-collapses the parens fails before it ships.
+    //
+    // `octokit.graphql` takes the document as arg[0] and the variables
+    // object as arg[1]; the rendered search string lives under
+    // `args[1].searchQuery`.
+    const graphqlSpy = vi.fn(async () => ({
+      search: {
+        pageInfo: { hasNextPage: false, endCursor: null },
+        nodes: [],
+      },
+    }));
+    const octokit = { graphql: graphqlSpy };
+    await listPullsInWindow(octokit as never, "maxi-tools", 30, 5);
+    const vars = graphqlSpy.mock.calls[0]?.[1] as Record<string, unknown>;
+    const query = vars?.["searchQuery"];
+    expect(typeof query).toBe("string");
+    const rendered = query as string;
+    // The whole-org form, with the hoisted `is:pr is:closed` shared scope.
+    expect(rendered).toMatch(/org:maxi-tools/);
+    expect(rendered).toMatch(/is:pr/);
+    expect(rendered).toMatch(/is:closed/);
+    // Each OR branch MUST be wrapped in its own parens.
+    expect(rendered).toMatch(/\(merged:>=2026-08-20\)/);
+    expect(rendered).toMatch(/\(closed:>=2026-08-20\)/);
+    // The single-outer-paren shape that returns 0 must not reappear.
+    // The bad shape: `(merged:>=D OR closed:>=D)` — one open paren,
+    // no close paren before the OR.
+    expect(rendered).not.toMatch(/\(merged:>=[^)]*OR[^)]*closed:>=/);
+  });
 });
 
 describe("listReviewThreads", () => {

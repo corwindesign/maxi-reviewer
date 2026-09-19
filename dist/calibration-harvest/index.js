@@ -71223,11 +71223,18 @@ async function reviewer_profile_build_paginate(fetcher, extractNodes, limit) {
 /**
  * Walk the org's merged/closed pull requests in the trailing window. The
  * search query narrows on `is:pr` and the merge/close date so we don't
- * enumerate every open PR in the org just to filter server-side. The
- * OR clause is parenthesised — GitHub's search applies `OR` with lower
- * precedence than the implicit AND, so `a OR b sort:updated-desc` would
- * otherwise read as `(a) OR (b sort:updated-desc)` and pull the entire
- * platform's issues into scope.
+ * enumerate every open PR in the org just to filter server-side.
+ *
+ * The OR's two sides MUST each be parenthesised individually. The shape
+ * `(a OR b)` — even though parens balance — returns zero results, because
+ * GitHub search's OR requires the entire OR-branch on each side to be
+ * wrapped, not the disjunction as a whole. The working form is
+ * `is:pr (merged:>=X) OR (closed:>=X)` — the `is:pr` is hoisted out so
+ * it applies to both branches; a disjunction like
+ * `(is:pr merged:>=X) OR (is:pr closed:>=X)` returns zero because the
+ * left-most qualifier scope differs between branches and the parser
+ * rejects it. Verified against `search(type: ISSUE)` directly, not
+ * through this client.
  */
 async function listPullsInWindow(octokit, org, windowDays, maxPulls) {
     const date = new Date(Date.now() - windowDays * 24 * 60 * 60 * 1000)
@@ -71237,7 +71244,7 @@ async function listPullsInWindow(octokit, org, windowDays, maxPulls) {
         org +
         " is:pr is:closed (merged:>=" +
         date +
-        " OR closed:>=" +
+        ") OR (closed:>=" +
         date +
         ") sort:updated-desc";
     const pulls = await reviewer_profile_build_paginate(async (cursor) => {
