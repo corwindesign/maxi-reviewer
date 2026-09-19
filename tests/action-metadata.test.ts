@@ -66,7 +66,17 @@ describe("action metadata", () => {
         .split(/\r?\n/)
         .map((line) => /^\s*group:\s*(.+?)\s*$/.exec(line))
         .filter((m): m is RegExpExecArray => m !== null)
-        .map((m) => m[1]);
+        // A trailing YAML comment is not part of the value, and neither are
+        // the quotes around it. Without this, `group: x # why` compares as
+        // `x # why`, so two groups that genuinely differ could compare equal
+        // -- or two identical ones differ -- for a reason having nothing to
+        // do with concurrency, which is exactly the failure this test was
+        // rewritten to stop making. Quotes come off FIRST when the value is
+        // quoted, because a `#` inside quotes is data, not a comment.
+        .map((m) => {
+          const quoted = /^(['"])(.*)\1(?:\s+#.*)?$/.exec(m[1]);
+          return quoted ? quoted[2] : m[1].replace(/\s+#.*$/, "").trim();
+        });
       if (groups.length === 0) throw new Error("no concurrency group declared");
       return groups;
     };
@@ -204,8 +214,18 @@ describe("action metadata", () => {
       inputMinutes,
       "maxi-review.yml declares no timeout_minutes"
     ).not.toBeNull();
+    // Anchored on the STEP NAME, and tempered so it cannot leave that step.
+    // This used to require `uses:` on the line immediately after
+    // `timeout-minutes:`; YAML keys are unordered, so inserting an `id:` or
+    // reordering the two would have failed this suite on a file that was
+    // still internally consistent -- the same class of mistake as pinning
+    // the literal 55. `(?:(?!\n\s*- )[\s\S])*?` stops the scan at the next
+    // list item, so a reviewer step with NO bound cannot silently borrow the
+    // bound of a later step and pass.
     const stepMinutes =
-      /timeout-minutes:\s*(\d+)\s*\n\s*uses:.*maxi-review/.exec(workflow);
+      /name: Run maxi-reviewer(?:(?!\n\s*- )[\s\S])*?timeout-minutes:\s*"?(\d+)"?/.exec(
+        workflow
+      );
     expect(
       stepMinutes,
       "no timeout-minutes on the maxi-reviewer step"
@@ -224,7 +244,7 @@ describe("action metadata", () => {
     // VALUE is checked by the arithmetic immediately above, against whatever
     // maxi-config currently passes.
     expect(workflow).toMatch(
-      /name: Run maxi-reviewer[\s\S]*?timeout-minutes: \d+[\s\S]*?uses: maxi-tools\/maxi-reviewer@/
+      /name: Run maxi-reviewer(?:(?!\n\s*- )[\s\S])*?timeout-minutes: \d+(?:(?!\n\s*- )[\s\S])*?uses: maxi-tools\/maxi-reviewer@/
     );
     // And the job cap sits above it with room for setup. The cap covers the
     // whole job — checkout, app-token mint, the pinned maxi-lint cargo
