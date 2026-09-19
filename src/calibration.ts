@@ -62,10 +62,19 @@ export interface LowPrecisionOptions {
   maxAcceptRate?: number;
 }
 
-function pathGroupOf(path: string): string {
-  if (!path) return "(unknown)";
-  const slash = path.indexOf("/");
-  return slash === -1 ? path : path.slice(0, slash);
+/**
+ * The top-level path segment used to bucket a finding for `byPath`. Exported
+ * so callers can bucket paths the same way this module does.
+ *
+ * Strips leading `/` (and repeats of it) before bucketing so a repository
+ * path with a leading slash, e.g. `/src/a.ts`, lands in the same `src`
+ * bucket as `src/a.ts` instead of the meaningless `""` key.
+ */
+export function pathGroupOf(path: string): string {
+  const normalized = (path || "").replace(/^\/+/, "");
+  if (!normalized) return "(unknown)";
+  const slash = normalized.indexOf("/");
+  return slash === -1 ? normalized : normalized.slice(0, slash);
 }
 
 interface CommentRow {

@@ -5,6 +5,7 @@ import {
   aggregateCalibration,
   lowPrecisionRules,
   buildCalibrationReport,
+  pathGroupOf,
   EmittedFinding,
 } from "../src/calibration.js";
 import { ReviewArtifact } from "../src/types.js";
@@ -171,6 +172,18 @@ describe("extractEmittedFindings", () => {
     const found = extractEmittedFindings(a);
     expect(found).toHaveLength(1);
     expect(found[0].path).toBe("src/d.ts");
+  });
+});
+
+describe("pathGroupOf", () => {
+  it.each([
+    ["src/a.ts", "src"],
+    ["/src/a.ts", "src"],
+    ["//src/a.ts", "src"],
+    ["a.ts", "a.ts"],
+    ["", "(unknown)"],
+  ])("groups %s as %s", (input, expected) => {
+    expect(pathGroupOf(input)).toBe(expected);
   });
 });
 
