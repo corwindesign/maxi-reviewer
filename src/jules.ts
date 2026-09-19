@@ -125,9 +125,17 @@ export async function runJulesReview(
     await waitUntilSessionReady(session);
   }
 
+  // One wall-clock deadline for the whole review, including every repair and
+  // retrieval round below. Each round previously requested a fresh
+  // `timeoutMinutes * 60 * 1000` budget of its own, so a slow-but-not-hung
+  // initial poll plus a repair round could together run for up to double the
+  // configured timeout instead of being bound by it.
+  const deadline = Date.now() + timeoutMinutes * 60 * 1000;
+  const remainingBudgetMs = () => Math.max(0, deadline - Date.now());
+
   let reviewMessage = await pollForReview(
     session,
-    timeoutMinutes * 60 * 1000,
+    remainingBudgetMs(),
     afterMessage,
     options.onProgress,
     setupBudgetFor(resumed, options)
@@ -143,7 +151,7 @@ export async function runJulesReview(
       session,
       firstMessage: reviewMessage,
       retrieval: options.retrieval,
-      timeoutMs: timeoutMinutes * 60 * 1000,
+      timeoutMs: remainingBudgetMs(),
       onProgress: options.onProgress,
     });
   }
@@ -167,7 +175,7 @@ export async function runJulesReview(
     );
     const repairedMessage = await pollForReview(
       session,
-      timeoutMinutes * 60 * 1000,
+      remainingBudgetMs(),
       reviewMessage,
       options.onProgress
     );
@@ -207,7 +215,7 @@ export async function runJulesReview(
     );
     const revisedMessage = await pollForReview(
       session,
-      timeoutMinutes * 60 * 1000,
+      remainingBudgetMs(),
       latestReviewMessage,
       options.onProgress
     );
@@ -240,7 +248,7 @@ export async function runJulesReview(
     const verified = await requestStructuredValidationRepair({
       session,
       latestReviewMessage,
-      timeoutMinutes,
+      timeoutMs: remainingBudgetMs(),
       verificationContext: options.verificationContext,
       onProgress: options.onProgress,
     });
@@ -461,7 +469,7 @@ function formatJulesSource(source: any): string {
 async function requestStructuredValidationRepair(input: {
   session: JulesSession;
   latestReviewMessage: string;
-  timeoutMinutes: number;
+  timeoutMs: number;
   verificationContext: VerificationContext;
   onProgress?: (progress: ReviewProgress) => void | Promise<void>;
 }): Promise<{
@@ -491,7 +499,7 @@ async function requestStructuredValidationRepair(input: {
   );
   const revisedMessage = await pollForReview(
     input.session,
-    input.timeoutMinutes * 60 * 1000,
+    input.timeoutMs,
     input.latestReviewMessage,
     input.onProgress
   );
@@ -781,6 +789,38 @@ function createSetupWatch(
   };
 }
 
+/**
+ * Races `promise` against a timer so a hung network call cannot outlive
+ * `ms`. Without this, `session.hydrate()`/`session.history()` had no timeout
+ * of their own and a single hung call could hold the poll loop (and the
+ * runner) well past `deadline`, which is exactly the "step 12 hangs with no
+ * output" failure mode this file exists to prevent.
+ */
+function withTimeout<T>(
+  promise: Promise<T>,
+  ms: number,
+  label: string
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(
+      () => {
+        reject(new Error(`${label} timed out after ${ms}ms`));
+      },
+      Math.max(0, ms)
+    );
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err);
+      }
+    );
+  });
+}
+
 async function pollForReview(
   session: JulesSession,
   timeoutMs: number,
@@ -811,11 +851,21 @@ async function pollForReview(
     // poll hiccup, so it must not land in a catch that resumes waiting.
     await setupWatch.check(attempt);
     try {
-      await session.hydrate();
+      await withTimeout(
+        session.hydrate(),
+        deadline - Date.now(),
+        "session.hydrate()"
+      );
       let last = "";
-      for await (const a of session.history()) {
-        if (a.type === "agentMessaged") last = a.message;
-      }
+      await withTimeout(
+        (async () => {
+          for await (const a of session.history()) {
+            if (a.type === "agentMessaged") last = a.message;
+          }
+        })(),
+        deadline - Date.now(),
+        "session.history()"
+      );
       if (last) {
         sawAgentOutput = true;
         if (afterMessage !== undefined && last === afterMessage) {
