@@ -148,6 +148,13 @@ describe("listPullsInWindow", () => {
     // `octokit.graphql` takes the document as arg[0] and the variables
     // object as arg[1]; the rendered search string lives under
     // `args[1].searchQuery`.
+    //
+    // The window start is derived from the wall clock (now - windowDays), so
+    // the clock is pinned here: under the real timers this describe block
+    // installs, the literal dates below are correct only on the day the test
+    // was written, and the suite would start failing the next day.
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-19T00:00:00Z"));
     const graphqlSpy = vi.fn(async () => ({
       search: {
         pageInfo: { hasNextPage: false, endCursor: null },
@@ -155,7 +162,12 @@ describe("listPullsInWindow", () => {
       },
     }));
     const octokit = { graphql: graphqlSpy };
-    await listPullsInWindow(octokit as never, "maxi-tools", 30, 5);
+    try {
+      await listPullsInWindow(octokit as never, "maxi-tools", 30, 5);
+    } finally {
+      // Never leave the fake clock installed for whatever runs next.
+      vi.useRealTimers();
+    }
     const vars = graphqlSpy.mock.calls[0]?.[1] as Record<string, unknown>;
     const query = vars?.["searchQuery"];
     expect(typeof query).toBe("string");
