@@ -78,11 +78,50 @@ describe("classifyOutcome", () => {
     expect(outcome).toBe("accepted");
   });
 
-  it("also accepts when a later commit touched another file in the same path group", () => {
+  // This asserted the OPPOSITE until 2026-09-19, and the example is why it
+  // survived: lib.rs and peer.rs are the same crate and the same directory,
+  // so "another file in the same path group" read as "a nearby related file".
+  //
+  // `pathGroupFor` does not implement proximity. It buckets every `.rs` file
+  // outside a test directory as `rust-src`, repository-wide. The narrow
+  // example licensed a global rule -- on a Rust PR, ANY later Rust commit
+  // accepted EVERY Rust finding on that PR.
+  //
+  // Both cases are asserted now, the neighbour and the stranger, so the real
+  // scope of the rule is written down instead of implied by one example.
+  it("does not accept on a sibling file in the same directory", () => {
     const outcome = classifyOutcome(
       baseFinding({
         path: "crates/maxi-kvm-core/src/lib.rs",
         subsequentTouchedPaths: ["crates/maxi-kvm-core/src/peer.rs"],
+      })
+    );
+    expect(outcome).toBe("unaddressed");
+  });
+
+  it("does not accept on an unrelated file that merely shares a path group", () => {
+    // Both are `rust-src`. Under the old rule this was indistinguishable
+    // from the author fixing the line, and it is what inflated every rate
+    // in the 2026-09-19 harvest: `rust-src` came out top for six of seven
+    // reviewers because it is the broadest bucket, not the best-reviewed.
+    const outcome = classifyOutcome(
+      baseFinding({
+        path: "crates/maxi-kvm-core/src/lib.rs",
+        subsequentTouchedPaths: ["crates/maxi-kvm-video/src/owned.rs"],
+      })
+    );
+    expect(outcome).toBe("unaddressed");
+  });
+
+  it("still accepts when the touched list contains that exact file", () => {
+    // The guard against over-correcting: a real fix must still register.
+    const outcome = classifyOutcome(
+      baseFinding({
+        path: "crates/maxi-kvm-core/src/lib.rs",
+        subsequentTouchedPaths: [
+          "crates/maxi-kvm-video/src/owned.rs",
+          "crates/maxi-kvm-core/src/lib.rs",
+        ],
       })
     );
     expect(outcome).toBe("accepted");
