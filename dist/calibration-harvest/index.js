@@ -71117,8 +71117,8 @@ async function trustedArtifactCommentAuthors(octokit) {
 
 
 const PULLS_QUERY = /* GraphQL */ `
-  query HarvestPulls($query: String!, $first: Int!, $cursor: String) {
-    search(query: $query, type: ISSUE, first: $first, after: $cursor) {
+  query HarvestPulls($searchQuery: String!, $first: Int!, $cursor: String) {
+    search(query: $searchQuery, type: ISSUE, first: $first, after: $cursor) {
       pageInfo {
         hasNextPage
         endCursor
@@ -71233,10 +71233,13 @@ async function listPullsInWindow(octokit, org, windowDays, maxPulls) {
     const date = new Date(Date.now() - windowDays * 24 * 60 * 60 * 1000)
         .toISOString()
         .slice(0, 10);
-    const query = `org:${org} is:pr is:closed (merged:>=${date} OR closed:>=${date}) sort:updated-desc`;
+    const searchQuery = `org:${org} is:pr is:closed (merged:>=${date} OR closed:>=${date}) sort:updated-desc`;
     const pulls = await reviewer_profile_build_paginate(async (cursor) => {
+        // `query` is reserved by @octokit/graphql as the document key; pass
+        // the GraphQL variable under its declared name (`$searchQuery`) so
+        // the library doesn't throw `cannot be used as variable name`.
         const response = (await octokit.graphql(PULLS_QUERY, {
-            query,
+            searchQuery,
             first: 50,
             cursor,
         }));

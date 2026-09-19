@@ -67,8 +67,8 @@ describe("listPullsInWindow", () => {
   it("walks the org search API and maps mergedAt / closedAt to terminusAt", async () => {
     let capturedQuery = "";
     const octokit = makeOctokit({
-      '["cursor","first","query"]': (vars) => {
-        capturedQuery = String(vars.query);
+      '["cursor","first","searchQuery"]': (vars) => {
+        capturedQuery = String(vars.searchQuery);
         return {
           search: {
             pageInfo: { hasNextPage: false, endCursor: null },
@@ -108,6 +108,27 @@ describe("listPullsInWindow", () => {
     expect(capturedQuery).toContain("org:maxi-tools");
     expect(capturedQuery).toContain("is:pr");
     expect(capturedQuery).toContain("is:closed");
+  });
+
+  it("passes its variables object without a reserved `query` key", async () => {
+    // Regression for the @octokit/graphql reserved-key guard: passing
+    // `{ query: ... }` causes `octokit.graphql` to throw
+    // `"query" cannot be used as variable name`. Inspect the variables
+    // object handed to `graphql` directly so we catch a future regression
+    // even if the handler-key dispatch above were loosened.
+    const graphqlSpy = vi.fn(async () => ({
+      search: {
+        pageInfo: { hasNextPage: false, endCursor: null },
+        nodes: [],
+      },
+    }));
+    const octokit = { graphql: graphqlSpy } as unknown as FakeOctokit;
+    await listPullsInWindow(octokit as never, "maxi-tools", 30, 5);
+    expect(graphqlSpy).toHaveBeenCalledTimes(1);
+    const vars = graphqlSpy.mock.calls[0]?.[1] as Record<string, unknown>;
+    expect(vars).toBeDefined();
+    expect(Object.keys(vars)).not.toContain("query");
+    expect(Object.keys(vars)).toContain("searchQuery");
   });
 });
 
@@ -231,7 +252,7 @@ describe("listCommitsAfter", () => {
 describe("harvest", () => {
   it("emits findings for every bot thread and a calibration report for maxi-reviewer artifacts", async () => {
     const octokit = makeOctokit({
-      '["cursor","first","query"]': () => ({
+      '["cursor","first","searchQuery"]': () => ({
         search: {
           pageInfo: { hasNextPage: false, endCursor: null },
           nodes: [
@@ -347,7 +368,7 @@ describe("harvest", () => {
 
   it("returns zero findings when no PRs match", async () => {
     const octokit = makeOctokit({
-      '["cursor","first","query"]': () => ({
+      '["cursor","first","searchQuery"]': () => ({
         search: {
           pageInfo: { hasNextPage: false, endCursor: null },
           nodes: [],
@@ -544,7 +565,7 @@ describe("runScheduledHarvest", () => {
         string,
         (vars: Record<string, unknown>) => unknown
       > = {
-        '["cursor","first","query"]': () => ({
+        '["cursor","first","searchQuery"]': () => ({
           search: {
             pageInfo: { hasNextPage: false, endCursor: null },
             nodes: [
