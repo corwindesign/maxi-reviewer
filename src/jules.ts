@@ -418,7 +418,11 @@ async function startReviewSession(
   }
 
   core.info("Creating Jules review session…");
-  const rawSession = await createReviewSession(customJules, prompt, source);
+  const rawSession = await withTimeout(
+    createReviewSession(customJules, prompt, source),
+    remainingBudgetMs(),
+    "createReviewSession"
+  );
   return { session: rawSession as unknown as JulesSession, resumed: false };
 }
 

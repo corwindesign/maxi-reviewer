@@ -1036,6 +1036,31 @@ describe("jules.ts", () => {
       await expect(promise).rejects.toThrow(/session\.info\(\) timed out/);
     });
 
+    it("does not let a hung createReviewSession on the fresh-session path outlive the deadline", async () => {
+      const mockJulesWith = vi.fn().mockReturnValue({
+        // Never resolves: this is the SDK call behind createReviewSession,
+        // the common (non-resume) path. Without a withTimeout wrap it would
+        // hold the action past the wall-clock deadline — the #53 hang.
+        session: vi.fn().mockImplementation(() => new Promise(() => {})),
+      });
+      (jules as any).with = mockJulesWith;
+
+      const promise = runJulesReview("api-key", "prompt", {}, 1);
+      let settled = false;
+      promise.then(
+        () => {
+          settled = true;
+        },
+        () => {
+          settled = true;
+        }
+      );
+
+      await vi.advanceTimersByTimeAsync(61 * 1000);
+      expect(settled).toBe(true);
+      await expect(promise).rejects.toThrow(/createReviewSession timed out/);
+    });
+
     it("does not let a hung session.send() outlive the remaining budget", async () => {
       const badReview = "not valid json at all";
       let historyCalls = 0;

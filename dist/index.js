@@ -70744,7 +70744,7 @@ source, previousSessionId, remainingBudgetMs) {
         }
     }
     core/* info */.pq("Creating Jules review session…");
-    const rawSession = await createReviewSession(customJules, prompt, source);
+    const rawSession = await withTimeout(createReviewSession(customJules, prompt, source), remainingBudgetMs(), "createReviewSession");
     return { session: rawSession, resumed: false };
 }
 async function createReviewSession(customJules, prompt, 
