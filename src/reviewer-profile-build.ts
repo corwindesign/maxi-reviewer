@@ -453,19 +453,25 @@ export async function harvest(
       committedDate: string;
       paths: string[];
     }> = [];
-    if (botThreads.some((t) => !t.isResolved)) {
-      try {
-        commits = await listCommitsAfter(
-          octokit,
-          pull,
-          maxTouchedPathsPerPull,
-          maxCommitsPerPull
-        );
-      } catch (err) {
-        core.warning(
-          `harvest: commits fetch failed for ${pull.owner}/${pull.repo}#${pull.number}: ${String(err)}`
-        );
-      }
+    // Walk the commits for EVERY PR that has bot threads, not just those
+    // with an unresolved one. A resolved thread still needs the commit list
+    // to tell `accepted` (the author pushed a fix, then closed the thread)
+    // from `dismissed` (closed with no commit touching the file) — and since
+    // the merge rules require threads to be resolved before merging, gating
+    // the walk on an unresolved thread made `accepted` unreachable for
+    // nearly every merged PR. That is what produced a 0% accept rate across
+    // all seven reviewers over a 270-PR window.
+    try {
+      commits = await listCommitsAfter(
+        octokit,
+        pull,
+        maxTouchedPathsPerPull,
+        maxCommitsPerPull
+      );
+    } catch (err) {
+      core.warning(
+        `harvest: commits fetch failed for ${pull.owner}/${pull.repo}#${pull.number}: ${String(err)}`
+      );
     }
 
     function touchedPathsAfterThread(thread: ReviewThreadRef): string[] {
