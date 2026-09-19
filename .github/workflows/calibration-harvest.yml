@@ -1,0 +1,193 @@
+# Weekly reviewer-profile calibration harvest. Walks merged/closed PRs across
+# the org, classifies inline review threads from the seven bot reviewers the
+# org runs (codacy-production, coderabbitai, qltysh, chatgpt-codex-connector,
+# cubic-dev-ai, github-advanced-security, maxi-reviewer), and publishes
+# `reviewer-profiles.json` as a release asset on the rolling tag
+# `reviewer-profiles-latest` so consumers fetch one URL with no checkout.
+#
+# The selector (T3 in the issue #17 follow-up plan) consumes this asset. The
+# asset must also be valid when absent — the selector's tolerance for a
+# missing profile is the reason this workflow does not gate the merge queue,
+# only the rolling tag.
+#
+# Self-hosted, not X64-pinned: see maxi-config#649 for the X64 vs ARM64 vs
+# generic-Linux trade. This job does not run user-supplied code; it only
+# queries the GitHub GraphQL API and writes two JSON files. No checkout, no
+# pnpm install, no dist verification, so the runner-type constraint that
+# exists for `ci.yml` and `issue-17-regression.yml` does not apply.
+
+name: Calibration Harvest
+
+on:
+  schedule:
+    # Weekly, Monday 06:00 UTC. Late enough that the weekend's merged PRs are
+    # in the harvest window, early enough that the result is in `latest` before
+    # Monday's standup.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+    inputs:
+      window_days:
+        description: "Trailing window in days (default 30)."
+        required: false
+        default: "30"
+      max_pulls:
+        description: "Maximum PRs to scan (default 500)."
+        required: false
+        default: "500"
+      dry_run:
+        description: "Set to 1 to skip the release publish and write to /tmp."
+        required: false
+        default: "0"
+
+permissions: {}
+
+concurrency:
+  # Two concurrent harvest runs would race on the same rolling tag and one
+  # of them would lose its asset. The group serialises across schedules and
+  # manual dispatches, so a backfill cannot stomp a fresh run.
+  group: calibration-harvest
+  cancel-in-progress: false
+
+jobs:
+  harvest:
+    runs-on: [self-hosted, Linux]
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      # GraphQL cross-repo search (`org:maxi-tools is:pr ...`) needs
+      # `issues: read` at the org level. The default `GITHUB_TOKEN` here does
+      # not include it; the App token mint below grants it on the calling
+      # repo and the org-wide App installation provides it on every member
+      # repo. (The workflow's `metadata: read` line that used to live here
+      # was a typo — `metadata` is not a permission scope in the
+      # permissions: block; the org-wide read is granted by `issues: read`
+      # on the App token.)
+      issues: read
+      pull-requests: read
+    steps:
+      - name: Resolve inputs
+        id: inputs
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          DISPATCH_WINDOW: ${{ inputs.window_days }}
+          DISPATCH_MAX: ${{ inputs.max_pulls }}
+          DISPATCH_DRY: ${{ inputs.dry_run }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            {
+              echo "window_days=${DISPATCH_WINDOW:-30}"
+              echo "max_pulls=${DISPATCH_MAX:-500}"
+              echo "dry_run=${DISPATCH_DRY:-0}"
+            } >> "$GITHUB_OUTPUT"
+          else
+            {
+              echo "window_days=30"
+              echo "max_pulls=500"
+              echo "dry_run=0"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Mint a token with org-wide metadata:read
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.APP_CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: maxi-tools
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: read
+          permission-issues: read
+          permission-pull-requests: read
+
+      - name: Checkout repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          # Same reason as ci.yml: the harvest doesn't push, so the runner
+          # shouldn't carry the credential into .git/config.
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: "24"
+
+      - name: Install dependencies
+        # pnpm matches the lockfile's content-addressed layout; npm's flat
+        # tree would force @actions/github to resolve differently and break
+        # the bundle at the next ncc rebuild.
+        run: |
+          npm install -g pnpm@10
+          pnpm install --frozen-lockfile
+
+      - name: Build harvest bundle
+        run: npx ncc build src/calibration-harvest.ts -o dist/calibration-harvest --source-map --license licenses.txt
+
+      - name: Run harvest
+        id: run
+        env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+          INPUT_ORG: maxi-tools
+          INPUT_WINDOW_DAYS: ${{ steps.inputs.outputs.window_days }}
+          INPUT_MAX_PULLS: ${{ steps.inputs.outputs.max_pulls }}
+          INPUT_DRY_RUN: ${{ steps.inputs.outputs.dry_run }}
+        run: node dist/calibration-harvest/index.js
+
+      - name: Verify profile shape
+        # The downstream selector reads `reviewer-profiles.json` via raw fetch;
+        # a malformed file would silently produce an empty routing table. The
+        # smoke check is a Node one-liner so the workflow doesn't depend on jq
+        # or python in PATH.
+        run: |
+          node -e '
+            const path = process.env.REVIEWER_PROFILES_PATH;
+            const data = JSON.parse(require("fs").readFileSync(path, "utf8"));
+            if (data.schema !== "maxi.review.v1.reviewer-profiles") {
+              console.error("schema mismatch:", data.schema);
+              process.exit(1);
+            }
+            const expected = [
+              "codacy-production", "coderabbitai", "qltysh",
+              "chatgpt-codex-connector", "cubic-dev-ai",
+              "github-advanced-security", "maxi-reviewer"
+            ];
+            for (const bot of expected) {
+              if (!data.reviewers[bot]) {
+                console.error("missing reviewer:", bot);
+                process.exit(1);
+              }
+            }
+            console.log("reviewer-profiles.json OK:", Object.keys(data.reviewers).length, "reviewers,", data.windowDays, "day window");
+          '
+
+      - name: Publish release
+        if: ${{ steps.inputs.outputs.dry_run != '1' }}
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          PROFILES_PATH: ${{ steps.run.outputs.profiles-path }}
+          CALIBRATION_PATH: ${{ steps.run.outputs.calibration-path }}
+        run: |
+          set -euo pipefail
+          # Idempotent: delete the existing release and tag, then re-cut. The
+          # data file's `generatedAt` is the version; the tag is just a
+          # pointer at the most recent publish.
+          if gh release view reviewer-profiles-latest >/dev/null 2>&1; then
+            echo "Deleting existing reviewer-profiles-latest release"
+            gh release delete reviewer-profiles-latest --yes --cleanup-tags
+          fi
+          gh release create reviewer-profiles-latest \
+            --title "reviewer-profiles-latest" \
+            --notes "Auto-generated per-reviewer calibration profile. See reviewer-profiles.json for the routing data and calibration.json for the per-rule / per-severity / per-path report over maxi-reviewer's own artifacts." \
+            --target "$GITHUB_SHA" \
+            "$PROFILES_PATH" \
+            "$CALIBRATION_PATH"
+          echo "Published reviewer-profiles-latest with $(basename "$PROFILES_PATH") and $(basename "$CALIBRATION_PATH")"
+
+      - name: Upload artifacts on dry-run
+        if: ${{ steps.inputs.outputs.dry_run == '1' }}
+        uses: actions/upload-artifact@847a78dd331cd6573c195a6c1cd045a78fe25e92 # v7
+        with:
+          name: calibration-harvest-dry-run
+          path: |
+            /tmp/reviewer-profiles.json
+            /tmp/calibration.json
+          retention-days: 7
