@@ -205,7 +205,7 @@ jobs:
           # pointer at the most recent publish.
           if gh release view reviewer-profiles-latest >/dev/null 2>&1; then
             echo "Deleting existing reviewer-profiles-latest release"
-            gh release delete reviewer-profiles-latest --yes --cleanup-tags
+            gh release delete reviewer-profiles-latest --yes --cleanup-tag
           fi
           gh release create reviewer-profiles-latest \
             --title "reviewer-profiles-latest" \
