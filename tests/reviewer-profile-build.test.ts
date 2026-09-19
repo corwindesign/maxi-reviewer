@@ -179,6 +179,14 @@ describe("listPullsInWindow", () => {
     // Each OR branch MUST be wrapped in its own parens.
     expect(rendered).toMatch(/\(merged:>=2026-08-20\)/);
     expect(rendered).toMatch(/\(closed:>=2026-08-20\)/);
+    // ...and the two branches MUST be joined by OR. Asserting the branches
+    // separately is not enough: `(merged:>=D) (closed:>=D)` satisfies both
+    // of the assertions above, but GitHub reads juxtaposition as AND, which
+    // matches only PRs that are both merged and closed-not-merged — i.e.
+    // nothing. Pin the whole shape, operator included.
+    expect(rendered).toMatch(
+      /\(merged:>=2026-08-20\)\s+OR\s+\(closed:>=2026-08-20\)/
+    );
     // The single-outer-paren shape that returns 0 must not reappear.
     // The bad shape: `(merged:>=D OR closed:>=D)` — one open paren,
     // no close paren before the OR.
