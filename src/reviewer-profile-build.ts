@@ -235,7 +235,14 @@ export async function listPullsInWindow(
   const date = new Date(Date.now() - windowDays * 24 * 60 * 60 * 1000)
     .toISOString()
     .slice(0, 10);
-  const searchQuery = `org:${org} is:pr is:closed (merged:>=${date} OR closed:>=${date}) sort:updated-desc`;
+  const searchQuery =
+    "org:" +
+    org +
+    " is:pr is:closed (merged:>=" +
+    date +
+    " OR closed:>=" +
+    date +
+    ") sort:updated-desc";
 
   const pulls = await paginate(
     async (cursor) => {

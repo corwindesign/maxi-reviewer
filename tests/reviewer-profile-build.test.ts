@@ -122,7 +122,12 @@ describe("listPullsInWindow", () => {
         nodes: [],
       },
     }));
-    const octokit = { graphql: graphqlSpy } as unknown as FakeOctokit;
+    // The inline mock implements only the subset of `Octokit` that
+    // `listPullsInWindow` exercises (the `graphql` call); `as never` on
+    // the call site matches the established test idiom in this file
+    // for partial Octokit fixtures (see other `listPullsInWindow`
+    // blocks above).
+    const octokit = { graphql: graphqlSpy };
     await listPullsInWindow(octokit as never, "maxi-tools", 30, 5);
     expect(graphqlSpy).toHaveBeenCalledTimes(1);
     const vars = graphqlSpy.mock.calls[0]?.[1] as Record<string, unknown>;

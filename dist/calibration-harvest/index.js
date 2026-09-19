@@ -71233,7 +71233,13 @@ async function listPullsInWindow(octokit, org, windowDays, maxPulls) {
     const date = new Date(Date.now() - windowDays * 24 * 60 * 60 * 1000)
         .toISOString()
         .slice(0, 10);
-    const searchQuery = `org:${org} is:pr is:closed (merged:>=${date} OR closed:>=${date}) sort:updated-desc`;
+    const searchQuery = "org:" +
+        org +
+        " is:pr is:closed (merged:>=" +
+        date +
+        " OR closed:>=" +
+        date +
+        ") sort:updated-desc";
     const pulls = await reviewer_profile_build_paginate(async (cursor) => {
         // `query` is reserved by @octokit/graphql as the document key; pass
         // the GraphQL variable under its declared name (`$searchQuery`) so
