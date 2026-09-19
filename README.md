@@ -279,11 +279,13 @@ as:
   file (or another file in the same `pathGroupFor()` group). This covers the
   most common "the author fixed it in a follow-up commit" case.
 - **dismissed** — the thread was resolved with no subsequent commit on the
-  same file. Resolved is treated as a deliberate close by either the thread
-  author or the PR author; "no edit" is the evidence the finding was not
+  same file (or another file in the same `pathGroupFor()` group).
+  Resolved is treated as a deliberate close by either the thread author
+  or the PR author; "no edit" is the evidence the finding was not
   actioned.
 - **unaddressed** — the thread is still open and no commit has touched the
-  file. Open + no edit = the finding is sitting there unresolved.
+  same file (or another file in the same `pathGroupFor()` group).
+  Open + no edit = the finding is sitting there unresolved.
 
 Unaddressed findings are not counted in the accept-rate denominator: a
 pending finding carries no signal yet, and we don't want to penalise a bot
