@@ -223,7 +223,110 @@ Supported PR comment or `workflow_dispatch` commands:
 - `/maxi fix <finding-id>`
 - `/maxi harvest`
 
-Fork PRs and stale heads are rejected for branch-writing flows.
+Fork PRs and stale-head branches are rejected for branch-writing flows.
+
+## Reviewer Calibration Profile
+
+A weekly scheduled job (`.github/workflows/calibration-harvest.yml`) walks the
+org's merged/closed PRs in a 30-day trailing window, classifies every inline
+review thread from the seven bot reviewers the org runs
+(`codacy-production`, `coderabbitai`, `qltysh`, `chatgpt-codex-connector`,
+`cubic-dev-ai`, `github-advanced-security`, `maxi-reviewer`), and publishes
+the result as a release asset on the rolling tag `reviewer-profiles-latest`:
+
+- `reviewer-profiles.json` — per-reviewer overall + by-path-group accept-rate.
+- `calibration.json` — the per-rule / per-severity / per-path report produced
+  by the existing `calibration.ts` engine over the harvested
+  `maxi.review.v1.review-artifact` payloads from `maxi-reviewer`.
+
+The workflow is `workflow_dispatch`-triggerable; pass `dry_run=1` to write to
+`/tmp` and skip the release publish.
+
+### Schema
+
+`reviewer-profiles.json` is the file downstream selectors read:
+
+```jsonc
+{
+  "schema": "maxi.review.v1.reviewer-profiles",
+  "generatedAt": "2026-09-18T06:00:00.000Z",
+  "windowDays": 30,
+  "reviewers": {
+    "coderabbitai": {
+      "overall":        { "n": 213, "acceptRate": 0.42 },
+      "byPathGroup": {
+        "rust-src":     { "n":  64, "acceptRate": 0.31 },
+        "workflows":    { "n":  29, "acceptRate": 0.55 },
+        "python":       { "n":  18, "acceptRate": 0.17 }
+      }
+    },
+    // ... one entry per bot
+  }
+}
+```
+
+`calibration.json` follows the `byRule` / `bySeverity` / `byPath` shape the
+existing `src/calibration.ts` engine already produces (see its docstring) and
+exists so the per-rule low-precision signal isn't lost when only the
+per-reviewer profile is published.
+
+### How to read it
+
+`acceptRate` is `accepted / (accepted + dismissed)`. A thread is classified
+as:
+
+- **accepted** — a commit after the thread's first comment touched the same
+  file (or another file in the same `pathGroupFor()` group). This covers the
+  most common "the author fixed it in a follow-up commit" case.
+- **dismissed** — the thread was resolved with no subsequent commit on the
+  same file (or another file in the same `pathGroupFor()` group).
+  Resolved is treated as a deliberate close by either the thread author
+  or the PR author; "no edit" is the evidence the finding was not
+  actioned.
+- **unaddressed** — the thread is still open and no commit has touched the
+  same file (or another file in the same `pathGroupFor()` group).
+  Open + no edit = the finding is sitting there unresolved.
+
+Unaddressed findings are not counted in the accept-rate denominator: a
+pending finding carries no signal yet, and we don't want to penalise a bot
+for an in-flight review. The trade is that a thread that drifts without
+resolution for a long window reads as 0% accepted. The harvest window
+defaults to 30 days precisely so the denominator shifts as threads age.
+
+### Path groups
+
+A path group is a routing bucket, not a verdict on the bot. The named
+buckets are `rust-src`, `rust-test`, `workflows`, `shell`, `python`, `docs`,
+`lockfile`, `config`; anything else falls into its top-level directory
+(`src`, `lib`, `crates`, ...). The exact `pathGroupFor()` rule lives in
+`src/reviewer-profile.ts` and the fixtures in
+`tests/reviewer-profile.test.ts` pin every named bucket.
+
+### Caveat — read this before routing on it
+
+A low accept-rate on a path group is a **routing signal**, not a verdict on
+the bot. Reviewers score differently across path groups for reasons that
+have nothing to do with quality: a reviewer that focuses on workflow YAML
+will underperform on Rust source by construction, because its findings are
+about a different surface. Use the profile to decide which reviewer to
+*route* to on which surface, not whether to trust it.
+
+A path group with `n < 20` in the window is too noisy to drive routing
+either way — the noise floor for this schema is `n = 20`. The selector that
+consumes this file should treat small-N groups as "no signal" rather than
+as evidence.
+
+The profile file is allowed to be absent. The selector MUST tolerate a
+404 on the rolling tag (a fresh repo, an App outage, an org on a different
+billing tier) and fall back to round-robin routing — the harvest job is
+best-effort and is not on the merge-gate critical path.
+
+### Triggering a backfill
+
+`Actions → Calibration Harvest → Run workflow` runs the harvest with the
+default 30-day window and publishes to the rolling tag. Pass `dry_run=1`
+to write to `/tmp` (uploaded as the `calibration-harvest-dry-run` artifact
+for inspection) without touching the release tag.
 
 ## Development
 
