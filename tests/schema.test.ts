@@ -3,6 +3,7 @@ import {
   validateAnalyzerFinding,
   validateJulesReview,
   validateReviewArtifact,
+  validateThreadState,
 } from "../src/schema.js";
 
 describe("maxi.review.v1 schemas", () => {
@@ -318,5 +319,22 @@ describe("maxi.review.v1 schemas", () => {
 
     expect(result.ok).toBe(false);
     expect(result.errors.join("\n")).toContain("outcomeSchema");
+  });
+
+  it("accepts a thread observation with an empty path and line 0", () => {
+    const result = validateThreadState({
+      path: "",
+      line: 0,
+      resolved: false,
+    });
+    expect(result.ok).toBe(true);
+  });
+
+  it("rejects a null or malformed thread observation", () => {
+    expect(validateThreadState(null).ok).toBe(false);
+    expect(validateThreadState({ path: "src/a.ts", line: 1 }).ok).toBe(false);
+    expect(
+      validateThreadState({ path: "src/a.ts", line: 1.5, resolved: true }).ok
+    ).toBe(false);
   });
 });

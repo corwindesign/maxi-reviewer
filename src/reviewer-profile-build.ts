@@ -24,7 +24,11 @@ import {
   pathGroupFor,
   ReviewerProfiles,
 } from "./reviewer-profile.js";
-import { buildCalibrationReport } from "./calibration.js";
+import {
+  CalibrationInput,
+  CalibrationReport,
+  ingestCalibration,
+} from "./calibration.js";
 import { extractReviewArtifact } from "./review-command.js";
 import { listReviewArtifactComments } from "./github.js";
 
@@ -369,7 +373,7 @@ export async function listCommitsAfter(
 export interface HarvestResult {
   findings: InlineReviewFinding[];
   /** Per-rule / per-severity / per-path calibration report from `calibration.ts`. */
-  calibration: ReturnType<typeof buildCalibrationReport>;
+  calibration: CalibrationReport;
   /** How many maxi-reviewer `maxi.review.v1.review-artifact` payloads we successfully harvested. */
   artifactsObserved: number;
 }
@@ -402,10 +406,7 @@ export async function harvest(
   core.info(`harvest: scanning ${pulls.length} merged/closed PRs in ${org}`);
 
   const findings: InlineReviewFinding[] = [];
-  const calibrationInputs: Array<{
-    artifact: Parameters<typeof buildCalibrationReport>[0][number]["artifact"];
-    threads: Parameters<typeof buildCalibrationReport>[0][number]["threads"];
-  }> = [];
+  const calibrationInputs: CalibrationInput[] = [];
   let artifactsObserved = 0;
   let pullIndex = 0;
   for (const pull of pulls) {
@@ -505,9 +506,7 @@ export async function harvest(
           resolved: t.isResolved,
         }));
         calibrationInputs.push({
-          artifact: artifact as Parameters<
-            typeof buildCalibrationReport
-          >[0][number]["artifact"],
+          artifact: artifact as CalibrationInput["artifact"],
           threads: threadStates,
         });
         artifactsObserved += 1;
@@ -519,9 +518,10 @@ export async function harvest(
     }
   }
 
-  const calibration = buildCalibrationReport(calibrationInputs);
+  const { report: calibration, excluded } =
+    ingestCalibration(calibrationInputs);
   core.info(
-    `harvest: calibration report produced ${calibration.byRule.length} rule groups, ${calibration.bySeverity.length} severity groups, ${calibration.byPath.length} path groups from ${artifactsObserved} artifacts`
+    `harvest: calibration report produced ${calibration.byRule.length} rule groups, ${calibration.bySeverity.length} severity groups, ${calibration.byPath.length} path groups from ${artifactsObserved} artifacts (${excluded.length} excluded)`
   );
 
   return { findings, calibration, artifactsObserved };
@@ -539,7 +539,7 @@ export interface RunHarvestOptions {
 
 export interface RunHarvestResult {
   profiles: ReviewerProfiles;
-  calibration: ReturnType<typeof buildCalibrationReport>;
+  calibration: CalibrationReport;
   artifactsObserved: number;
 }
 

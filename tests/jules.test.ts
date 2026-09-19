@@ -996,9 +996,10 @@ describe("jules.ts", () => {
 
       const promise = runJulesReview("api-key", "prompt", {}, 1);
       // The hung hydrate() eats the whole 60s deadline before its per-call
-      // timeout fires; the unconditional 20s poll delay after that pushes
-      // completion to ~80s. Without the per-call timeout this hydrate() call
-      // would never settle and this advance would leave `promise` pending.
+      // timeout fires; the post-catch poll delay is then min(20s, remaining)
+      // so the loop exits instead of sleeping past the deadline. Without the
+      // per-call timeout this hydrate() call would never settle and this
+      // advance would leave `promise` pending.
       await vi.advanceTimersByTimeAsync(90 * 1000);
 
       const result = await promise;
@@ -1006,6 +1007,68 @@ describe("jules.ts", () => {
         reviewResult: null,
         sessionId: "test-session-id",
       });
+    });
+
+    it("does not let a hung session.info() in waitUntilSessionReady outlive the deadline", async () => {
+      const mockSession = mockSessionWithHistory([]);
+      mockSession.info = vi
+        .fn()
+        .mockImplementation(() => new Promise(() => {}));
+
+      const mockJulesWith = vi.fn().mockReturnValue({
+        session: vi.fn().mockResolvedValue(mockSession),
+      });
+      (jules as any).with = mockJulesWith;
+
+      const promise = runJulesReview("api-key", "prompt", {}, 1);
+      let settled = false;
+      promise.then(
+        () => {
+          settled = true;
+        },
+        () => {
+          settled = true;
+        }
+      );
+
+      await vi.advanceTimersByTimeAsync(61 * 1000);
+      expect(settled).toBe(true);
+      await expect(promise).rejects.toThrow(/session\.info\(\) timed out/);
+    });
+
+    it("does not let a hung session.send() outlive the remaining budget", async () => {
+      const badReview = "not valid json at all";
+      let historyCalls = 0;
+      const session = {
+        id: "test-session-id",
+        info: vi.fn().mockResolvedValue({}),
+        hydrate: vi.fn().mockResolvedValue(1),
+        prompt: vi.fn().mockImplementation(() => new Promise(() => {})),
+        history: async function* () {
+          historyCalls++;
+          if (historyCalls === 1) return;
+          yield { type: "agentMessaged", message: badReview };
+        },
+      };
+      const mockJulesWith = vi.fn().mockReturnValue({
+        session: vi.fn().mockResolvedValue(session),
+      });
+      (jules as any).with = mockJulesWith;
+
+      const promise = runJulesReview("api-key", "prompt", {}, 1);
+      let settled = false;
+      promise.then(
+        () => {
+          settled = true;
+        },
+        () => {
+          settled = true;
+        }
+      );
+
+      await vi.advanceTimersByTimeAsync(61 * 1000);
+      expect(settled).toBe(true);
+      await expect(promise).rejects.toThrow(/session\.send\(\) timed out/);
     });
 
     it("bounds a JSON-repair round to the remaining budget, not a fresh full one", async () => {
