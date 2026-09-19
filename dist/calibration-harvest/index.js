@@ -71309,6 +71309,13 @@ async function listReviewThreads(octokit, pull, maxThreads) {
     return threads;
 }
 /**
+ * `repos.getCommit` caps a single response at 300 files. 100 per page keeps
+ * each response small; 30 pages is 3000 files, far past any real commit, so
+ * reaching the limit means something pathological rather than large.
+ */
+const COMMIT_FILE_PAGE_SIZE = 100;
+const COMMIT_FILE_PAGE_LIMIT = 30;
+/**
  * Walk the commits on this PR, returning `{oid, committedDate, paths}` in
  * reverse-chronological order.
  *
@@ -71405,13 +71412,38 @@ async function listCommitsAfter(octokit, pull, maxTouchedPaths, maxCommits, sinc
             continue;
         }
         try {
-            const { data } = await octokit.rest.repos.getCommit({
-                owner: pull.owner,
-                repo: pull.repo,
-                ref: entry.oid,
-            });
-            const paths = (data.files ?? []).map((f) => f.filename);
-            commits.push({ ...entry, paths, pathsKnown: true });
+            // PAGINATE. `repos.getCommit` returns at most 300 files in one
+            // response and puts the rest behind `Link: rel="next"`. Reading only
+            // the first page and then setting `pathsKnown: true` records an
+            // incomplete page as a complete record: a bot comment on a file that
+            // landed on page two classifies as `dismissed` rather than
+            // `accepted` — the same "partial result published as data" that #133
+            // is about, one API boundary further down.
+            const paths = [];
+            let filesKnown = true;
+            for (let page = 1; page <= COMMIT_FILE_PAGE_LIMIT; page += 1) {
+                const { data } = await octokit.rest.repos.getCommit({
+                    owner: pull.owner,
+                    repo: pull.repo,
+                    ref: entry.oid,
+                    per_page: COMMIT_FILE_PAGE_SIZE,
+                    page,
+                });
+                const files = data.files ?? [];
+                for (const f of files)
+                    paths.push(f.filename);
+                if (files.length < COMMIT_FILE_PAGE_SIZE)
+                    break;
+                if (page === COMMIT_FILE_PAGE_LIMIT) {
+                    // A full last page means more files exist than we are willing to
+                    // read. Say so rather than treating the prefix as the whole diff.
+                    filesKnown = false;
+                    complete = false;
+                    warning(`harvest: commit ${entry.oid.slice(0, 8)} on ${pull.owner}/${pull.repo}#${pull.number} has more than ` +
+                        `${COMMIT_FILE_PAGE_LIMIT * COMMIT_FILE_PAGE_SIZE} changed files; its path list is truncated`);
+                }
+            }
+            commits.push({ ...entry, paths, pathsKnown: filesKnown });
             touchedPaths += paths.length;
         }
         catch (err) {
@@ -71503,8 +71535,11 @@ async function harvest(octokit, org, windowDays, options = {}) {
             warning(`harvest: commits fetch failed for ${pull.owner}/${pull.repo}#${pull.number}: ${String(err)}`);
             walk = { commits: [], complete: false };
         }
-        if (!walk.complete)
-            degradedPulls += 1;
+        // `degraded` is decided AFTER the findings, on whether this PR yielded
+        // any known outcome -- not on `walk.complete`. A truncated walk that
+        // still closed every thread's slice taught us everything we needed, and
+        // counting it as degraded made a single-PR harvest of exactly that shape
+        // trip the all-degraded guard and throw.
         function touchedPathsAfterThread(thread) {
             if (!thread.createdAt)
                 return { paths: [], known: false };
@@ -71536,12 +71571,17 @@ async function harvest(octokit, org, windowDays, options = {}) {
                 ? { paths: out, known: true }
                 : { paths: [], known: false };
         }
+        let knownHere = 0;
+        let addedHere = 0;
         for (const thread of botThreads) {
             const reviewer = thread.firstAuthor;
             if (!reviewer || !isBotReviewer(reviewer))
                 continue;
             const path = thread.path ?? "";
             const touched = touchedPathsAfterThread(thread);
+            addedHere += 1;
+            if (touched.known)
+                knownHere += 1;
             findings.push({
                 reviewer: reviewer,
                 repo: `${pull.owner}/${pull.repo}`,
@@ -71553,6 +71593,11 @@ async function harvest(octokit, org, windowDays, options = {}) {
                 touchedPathsKnown: touched.known,
             });
         }
+        // Degraded means this PR taught us NOTHING -- every finding unknown --
+        // which is the state the all-degraded guard exists to catch. A PR that
+        // answered some threads and not others is partial, not blind.
+        if (addedHere > 0 && knownHere === 0)
+            degradedPulls += 1;
         // Calibration harvest: pull maxi-reviewer's `review-artifact` comments off
         // this PR, decode them, and feed each into `calibration.ts`. The thread
         // states we already walked above feed the same engine.

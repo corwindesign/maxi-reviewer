@@ -89,16 +89,35 @@ function makeOctokit(
         })),
       },
       repos: {
-        getCommit: vi.fn(async ({ ref }: { ref: string }) => {
-          if (!(ref in commitFiles)) {
-            throw new Error(`Unexpected getCommit for ref: ${ref}`);
+        // Paged, like the real endpoint: `repos.getCommit` caps a response
+        // at 300 files and puts the rest behind `Link: rel="next"`, so a
+        // fixture that always returns everything in one page cannot catch a
+        // caller that reads only the first.
+        getCommit: vi.fn(
+          async ({
+            ref,
+            per_page: perPage,
+            page,
+          }: {
+            ref: string;
+            per_page?: number;
+            page?: number;
+          }) => {
+            if (!(ref in commitFiles)) {
+              throw new Error(`Unexpected getCommit for ref: ${ref}`);
+            }
+            const all = commitFiles[ref];
+            const size = perPage ?? all.length;
+            const start = ((page ?? 1) - 1) * size;
+            return {
+              data: {
+                files: all
+                  .slice(start, start + size)
+                  .map((filename) => ({ filename })),
+              },
+            };
           }
-          return {
-            data: {
-              files: commitFiles[ref].map((filename) => ({ filename })),
-            },
-          };
-        }),
+        ),
       },
     },
   };
@@ -1088,7 +1107,7 @@ describe("truncation and partial failure are reported, not hidden", () => {
     updatedAt: "2026-09-10T01:00:00Z",
   };
 
-  function commitNode(oid, date) {
+  function commitNode(oid: string, date: string) {
     return {
       commit: { oid, authoredDate: date, committedDate: date },
     };
@@ -1149,22 +1168,131 @@ describe("truncation and partial failure are reported, not hidden", () => {
     // i.e. we saw a commit older than it -- has a complete answer regardless.
     // Bailing on `!walk.complete` threw away every thread on a large PR,
     // including recent ones whose commits were all present.
-    const finding = {
-      reviewer: "coderabbitai" as const,
-      repo: "maxi-tools/maxi-reviewer",
-      prNumber: 1,
-      path: "a.ts",
-      line: 1,
-      threadResolved: true,
-    };
-    // Simulated directly against the classifier: paths known, slice closed.
-    expect(
-      classifyOutcome({
-        ...finding,
-        subsequentTouchedPaths: ["a.ts"],
-        touchedPathsKnown: true,
-      })
-    ).toBe("accepted");
+    //
+    // Driven through `harvest`, deliberately. An earlier version of this
+    // test handed `subsequentTouchedPaths` and `touchedPathsKnown` straight
+    // to `classifyOutcome`, which never touches `listCommitsAfter` or
+    // `touchedPathsAfterThread` -- so restoring the bailout would not have
+    // failed it. A test that cannot fail for the behaviour it names is the
+    // defect this PR is about, one level up.
+    //
+    // maxCommitsPerPull = 3 against a page of three commits with
+    // hasNextPage true: every listed commit is kept, but MORE pages exist
+    // and are not read, so `walk.complete` is false. The thread is dated
+    // between c2 and c1, so its slice closes on c1 -- the omitted older
+    // commits cannot be after it, and the answer is complete anyway.
+    const octokit = makeOctokit(
+      {
+        HarvestPulls: () => ({
+          search: {
+            pageInfo: { hasNextPage: false, endCursor: null },
+            nodes: [
+              {
+                number: 7,
+                title: "t",
+                url: "u",
+                mergedAt: "2026-09-10T12:00:00Z",
+                closedAt: null,
+                updatedAt: "2026-09-10T12:00:00Z",
+                repository: { nameWithOwner: "maxi-tools/maxi-reviewer" },
+              },
+            ],
+          },
+        }),
+        HarvestThreads: () => ({
+          repository: {
+            pullRequest: {
+              reviewThreads: {
+                pageInfo: { hasNextPage: false, endCursor: null },
+                nodes: [
+                  {
+                    id: "T1",
+                    isResolved: true,
+                    path: "a.ts",
+                    line: 4,
+                    comments: {
+                      nodes: [
+                        {
+                          author: { login: "coderabbitai" },
+                          // Between c2 and c1: the slice closes on c1.
+                          createdAt: "2026-09-10T01:30:00Z",
+                          databaseId: 1,
+                        },
+                      ],
+                    },
+                  },
+                ],
+              },
+            },
+          },
+        }),
+        HarvestCommitPaths: () => ({
+          repository: {
+            pullRequest: {
+              commits: {
+                pageInfo: { hasNextPage: true, endCursor: "C2" },
+                nodes: [
+                  commitNode("c3", "2026-09-10T03:00:00Z"),
+                  commitNode("c2", "2026-09-10T02:00:00Z"),
+                  commitNode("c1", "2026-09-10T01:00:00Z"),
+                ],
+              },
+            },
+          },
+        }),
+      },
+      { c3: ["a.ts"], c2: ["b.ts"] }
+    );
+
+    const result = await harvest(octokit as never, "maxi-tools", 30, {
+      maxPulls: 5,
+      maxThreadsPerPull: 10,
+      maxCommitsPerPull: 3,
+    });
+
+    expect(result.findings).toHaveLength(1);
+    // The walk was truncated, but THIS thread's answer is complete.
+    expect(result.findings[0].touchedPathsKnown).toBe(true);
+    expect(classifyOutcome(result.findings[0])).toBe("accepted");
+  });
+
+  it("follows every page of a commit's changed files", async () => {
+    // `repos.getCommit` caps a response at 300 files. Reading only the first
+    // page and marking the paths known classifies a finding on a later page
+    // as `dismissed` rather than `accepted`.
+    const many = Array.from({ length: 150 }, (_, i) => `f${i}.ts`);
+    const octokit = makeOctokit(
+      {
+        HarvestCommitPaths: () => ({
+          repository: {
+            pullRequest: {
+              commits: {
+                pageInfo: { hasNextPage: false, endCursor: null },
+                nodes: [commitNode("big", "2026-09-10T02:00:00Z")],
+              },
+            },
+          },
+        }),
+      },
+      { big: many }
+    );
+    const walk = await listCommitsAfter(
+      octokit as never,
+      {
+        owner: "maxi-tools",
+        repo: "maxi-reviewer",
+        number: 1,
+        terminusAt: "2026-09-10T01:00:00Z",
+        updatedAt: "2026-09-10T01:00:00Z",
+      },
+      5000,
+      50
+    );
+    // 150 files over a 100-per-page fixture: the second page must be read.
+    expect(walk.commits[0].paths).toHaveLength(150);
+    expect(walk.commits[0].paths).toContain("f149.ts");
+    expect(walk.commits[0].pathsKnown).toBe(true);
+    expect(walk.complete).toBe(true);
   });
 
   it("counts a threads-leg failure as an observed, degraded PR", async () => {
