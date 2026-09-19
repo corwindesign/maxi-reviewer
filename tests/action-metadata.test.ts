@@ -53,27 +53,38 @@ describe("action metadata", () => {
     // would have failed the test for a reason having nothing to do with
     // concurrency groups, and it hard-coded LF. Scanning the block is
     // order-independent, tolerates CRLF, and says what it is looking for.
-    const groupOf = (workflow: string): string => {
-      const lines = workflow.split(/\r?\n/);
-      const start = lines.findIndex((line) => /^concurrency:\s*$/.test(line));
-      if (start === -1) throw new Error("no top-level concurrency block");
-      for (const line of lines.slice(start + 1)) {
-        if (/^\S/.test(line)) break; // dedented out of the block
-        const match = /^\s+group:\s*(.+?)\s*$/.exec(line);
-        if (match) return match[1];
-      }
-      throw new Error("concurrency block declares no group");
+    // Collects EVERY concurrency group in the file, at any indent.
+    //
+    // This scanned only a TOP-LEVEL `concurrency:` block and threw when it
+    // found none. maxi-review.yml is maxi-config-owned and moved its groups
+    // from the workflow level to per-job, so the scan threw and this suite
+    // failed on a file this repo does not control. What the test actually
+    // cares about is that the dogfood lane cannot evict the self-test, and
+    // that holds wherever the groups are declared.
+    const groupsOf = (workflow: string): string[] => {
+      const groups = workflow
+        .split(/\r?\n/)
+        .map((line) => /^\s*group:\s*(.+?)\s*$/.exec(line))
+        .filter((m): m is RegExpExecArray => m !== null)
+        .map((m) => m[1]);
+      if (groups.length === 0) throw new Error("no concurrency group declared");
+      return groups;
     };
 
     const read = (path: string) =>
       readFileSync(new URL(path, import.meta.url), "utf8");
-    const selfTest = groupOf(read("../.github/workflows/self-test.yml"));
-    const maxiReview = groupOf(read("../.github/workflows/maxi-review.yml"));
+    const selfTest = groupsOf(read("../.github/workflows/self-test.yml"));
+    const maxiReview = groupsOf(read("../.github/workflows/maxi-review.yml"));
 
-    expect(selfTest).not.toBe(maxiReview);
+    // No group in common: sharing one is what let maxi-review.yml's
+    // cancel-in-progress evict the self-test, 14 of 20 runs (#108).
+    const shared = selfTest.filter((g) => maxiReview.includes(g));
+    expect(shared, `shared concurrency group(s): ${shared.join(", ")}`).toEqual(
+      []
+    );
     // Both must still be per-PR, or one PR's run would evict another's.
-    expect(selfTest).toContain("github.event.pull_request.number");
-    expect(maxiReview).toContain("github.event.pull_request.number");
+    expect(selfTest.join(" ")).toContain("github.event.pull_request.number");
+    expect(maxiReview.join(" ")).toContain("github.event.pull_request.number");
   });
 
   it("builds the local action before dogfooding it", () => {
@@ -173,17 +184,47 @@ describe("action metadata", () => {
       new URL("../.github/workflows/maxi-review.yml", import.meta.url),
       "utf8"
     );
-    // 55, and this assertion was right all along — an earlier revision of this
-    // PR lowered it to 35 by reasoning from #59's prose instead of the shipped
-    // behaviour, which was a regression. The action enforces its own deadline
-    // in-process at `hard_timeout_minutes` = `timeout_minutes + 20` = 50, and
-    // the README requires the step bound above that (>=55) plus cleanup
-    // headroom, because a blocked event loop can stop the in-process timers and
-    // this outer bound is the real runner-release watchdog. 35 would fire first
-    // and kill a review still inside its own deadline.
-    expect(workflow).toContain("timeout-minutes: 55");
+    // The RELATIONSHIP, not the literal. This asserted `timeout-minutes: 55`,
+    // which was correct when the lane passed `timeout_minutes: 35` — but
+    // maxi-review.yml is maxi-config-owned, maxi-config lowered the input to
+    // 15, and the fan-out delivered a step bound of 40. The literal broke
+    // this suite on a change that was internally consistent at the source,
+    // which is the wrong thing to be pinned on: a repo should not assert a
+    // VALUE inside a file it does not own, only the invariant it depends on.
+    //
+    // The invariant: the action enforces its own deadline in-process at
+    // `hard_timeout_minutes` = `timeout_minutes + 20`, and the step bound must
+    // clear that with cleanup headroom, because a blocked event loop can stop
+    // the in-process timers and this outer bound is the real runner-release
+    // watchdog. A step bound at or below the in-process deadline would kill a
+    // review still inside its own budget — the regression this test exists to
+    // catch, and it catches it at any input value.
+    const inputMinutes = /timeout_minutes:\s*"?(\d+)"?/.exec(workflow);
+    expect(
+      inputMinutes,
+      "maxi-review.yml declares no timeout_minutes"
+    ).not.toBeNull();
+    const stepMinutes =
+      /timeout-minutes:\s*(\d+)\s*\n\s*uses:.*maxi-review/.exec(workflow);
+    expect(
+      stepMinutes,
+      "no timeout-minutes on the maxi-reviewer step"
+    ).not.toBeNull();
+    const input = Number(inputMinutes![1]);
+    const step = Number(stepMinutes![1]);
+    const hardDeadline = input + 20;
+    expect(
+      step,
+      `step bound ${step} must clear the in-process deadline ${hardDeadline} ` +
+        `(timeout_minutes ${input} + 20) with cleanup headroom`
+    ).toBeGreaterThan(hardDeadline);
+    // `\d+`, not the literal, for the same reason as above: this pins the
+    // SHAPE -- a named step, carrying a step bound, invoking the pinned
+    // action -- which is what stops the bound being dropped entirely. The
+    // VALUE is checked by the arithmetic immediately above, against whatever
+    // maxi-config currently passes.
     expect(workflow).toMatch(
-      /name: Run maxi-reviewer[\s\S]*?timeout-minutes: 55[\s\S]*?uses: maxi-tools\/maxi-reviewer@/
+      /name: Run maxi-reviewer[\s\S]*?timeout-minutes: \d+[\s\S]*?uses: maxi-tools\/maxi-reviewer@/
     );
     // And the job cap sits above it with room for setup. The cap covers the
     // whole job — checkout, app-token mint, the pinned maxi-lint cargo
