@@ -9,6 +9,7 @@ vi.mock("@actions/github", () => ({
   },
 }));
 
+import { readFileSync } from "node:fs";
 import * as github from "@actions/github";
 import {
   harvest,
@@ -17,7 +18,10 @@ import {
   listCommitsAfter,
   runScheduledHarvest,
 } from "../src/reviewer-profile-build.js";
-import { classifyOutcome } from "../src/reviewer-profile.js";
+import {
+  classifyOutcome,
+  aggregateReviewerProfiles,
+} from "../src/reviewer-profile.js";
 import { buildCalibrationReport } from "../src/calibration.js";
 import { extractReviewArtifact } from "../src/review-command.js";
 
@@ -31,18 +35,46 @@ interface FakeOctokit {
     users: {
       getAuthenticated: ReturnType<typeof vi.fn>;
     };
+    repos: {
+      getCommit: ReturnType<typeof vi.fn>;
+    };
   };
 }
 
+/**
+ * `commitFiles` maps a commit oid to the filenames REST reports for it.
+ *
+ * The shape below is the REAL `GET /repos/{owner}/{repo}/commits/{ref}`
+ * response shape — `{ data: { files: [{ filename }] } }`. The previous
+ * fixture invented `changedFilesIfAvailable: { nodes: [{ path }] }` to match
+ * what the code expected, and GitHub's schema has no such field: it is an
+ * `Int`. Because the fixture agreed with the code rather than with the
+ * server, the suite stayed green through a query the API rejects outright,
+ * and a 270-PR harvest reported 0% for every reviewer (#133).
+ *
+ * An oid with no entry throws, the way a fetch for an unreachable commit
+ * would, so a test must state which commits it expects to be read.
+ */
 function makeOctokit(
-  handlers: Record<string, (vars: Record<string, unknown>) => unknown>
+  handlers: Record<string, (vars: Record<string, unknown>) => unknown>,
+  commitFiles: Record<string, string[]> = {}
 ): FakeOctokit {
   return {
-    graphql: vi.fn(async (_query: string, vars: Record<string, unknown>) => {
-      const key = JSON.stringify(Object.keys(vars).sort());
-      const handler = handlers[key];
+    graphql: vi.fn(async (query: string, vars: Record<string, unknown>) => {
+      // Dispatch on the OPERATION NAME first. Keying only on the sorted
+      // variable names collides: HarvestThreads and HarvestCommitPaths take
+      // the same five variables, so a fixture that declared threads would
+      // silently answer the commit walk with a threads payload, the walk
+      // would find no `commits` connection, and the test would exercise a
+      // degraded path while appearing to cover the healthy one.
+      const op = /query\s+(\w+)/.exec(query)?.[1];
+      const byKey = JSON.stringify(Object.keys(vars).sort());
+      const handler =
+        (op !== undefined ? handlers[op] : undefined) ?? handlers[byKey];
       if (!handler) {
-        throw new Error(`Unexpected graphql call with vars: ${key}`);
+        throw new Error(
+          `Unexpected graphql call: operation=${op ?? "?"} vars=${byKey}`
+        );
       }
       return handler(vars);
     }),
@@ -56,6 +88,37 @@ function makeOctokit(
           data: { login: "maxi-tools-auth[bot]" },
         })),
       },
+      repos: {
+        // Paged, like the real endpoint: `repos.getCommit` caps a response
+        // at 300 files and puts the rest behind `Link: rel="next"`, so a
+        // fixture that always returns everything in one page cannot catch a
+        // caller that reads only the first.
+        getCommit: vi.fn(
+          async ({
+            ref,
+            per_page: perPage,
+            page,
+          }: {
+            ref: string;
+            per_page?: number;
+            page?: number;
+          }) => {
+            if (!(ref in commitFiles)) {
+              throw new Error(`Unexpected getCommit for ref: ${ref}`);
+            }
+            const all = commitFiles[ref];
+            const size = perPage ?? all.length;
+            const start = ((page ?? 1) - 1) * size;
+            return {
+              data: {
+                files: all
+                  .slice(start, start + size)
+                  .map((filename) => ({ filename })),
+              },
+            };
+          }
+        ),
+      },
     },
   };
 }
@@ -68,7 +131,7 @@ describe("listPullsInWindow", () => {
   it("walks the org search API and maps mergedAt / closedAt to terminusAt", async () => {
     let capturedQuery = "";
     const octokit = makeOctokit({
-      '["cursor","first","searchQuery"]': (vars) => {
+      HarvestPulls: (vars) => {
         capturedQuery = String(vars.searchQuery);
         return {
           search: {
@@ -198,7 +261,7 @@ describe("listPullsInWindow", () => {
 describe("listReviewThreads", () => {
   it("returns the first-comment author and createdAt per thread", async () => {
     const octokit = makeOctokit({
-      '["cursor","first","name","owner","pr"]': () => ({
+      HarvestThreads: () => ({
         repository: {
           pullRequest: {
             reviewThreads: {
@@ -260,40 +323,37 @@ describe("listReviewThreads", () => {
 
 describe("listCommitsAfter", () => {
   it("returns the commit list with paths in reverse-chronological order", async () => {
-    const octokit = makeOctokit({
-      '["cursor","first","name","owner","pr"]': () => ({
-        repository: {
-          pullRequest: {
-            commits: {
-              pageInfo: { hasNextPage: false, endCursor: null },
-              nodes: [
-                {
-                  commit: {
-                    oid: "a",
-                    authoredDate: "2026-09-10T00:00:00Z",
-                    committedDate: "2026-09-10T00:00:00Z",
-                    changedFilesIfAvailable: {
-                      nodes: [{ path: "src/a.ts" }, { path: "src/b.ts" }],
+    const octokit = makeOctokit(
+      {
+        HarvestCommitPaths: () => ({
+          repository: {
+            pullRequest: {
+              commits: {
+                pageInfo: { hasNextPage: false, endCursor: null },
+                nodes: [
+                  {
+                    commit: {
+                      oid: "a",
+                      authoredDate: "2026-09-10T00:00:00Z",
+                      committedDate: "2026-09-10T00:00:00Z",
                     },
                   },
-                },
-                {
-                  commit: {
-                    oid: "b",
-                    authoredDate: "2026-09-09T23:59:00Z",
-                    committedDate: "2026-09-09T23:59:00Z",
-                    changedFilesIfAvailable: {
-                      nodes: [{ path: "src/early.ts" }],
+                  {
+                    commit: {
+                      oid: "b",
+                      authoredDate: "2026-09-09T23:59:00Z",
+                      committedDate: "2026-09-09T23:59:00Z",
                     },
                   },
-                },
-              ],
+                ],
+              },
             },
           },
-        },
-      }),
-    });
-    const commits = await listCommitsAfter(
+        }),
+      },
+      { a: ["src/a.ts", "src/b.ts"], b: ["src/early.ts"] }
+    );
+    const walk = await listCommitsAfter(
       octokit as never,
       {
         owner: "maxi-tools",
@@ -307,106 +367,113 @@ describe("listCommitsAfter", () => {
     );
     // The list is reverse-chronological by GitHub's contract; commit "a"
     // (newer) appears before "b" (older).
-    expect(commits.map((c) => c.oid)).toEqual(["a", "b"]);
-    expect(commits[0].paths).toContain("src/a.ts");
+    expect(walk.commits.map((c) => c.oid)).toEqual(["a", "b"]);
+    // A complete walk is part of the contract: an incomplete one would
+    // classify every finding on this PR as unknown.
+    expect(walk.complete).toBe(true);
+    expect(walk.commits[0].paths).toContain("src/a.ts");
   });
 });
 
 describe("harvest", () => {
   it("emits findings for every bot thread and a calibration report for maxi-reviewer artifacts", async () => {
-    const octokit = makeOctokit({
-      '["cursor","first","searchQuery"]': () => ({
-        search: {
-          pageInfo: { hasNextPage: false, endCursor: null },
-          nodes: [
-            {
-              number: 7,
-              title: "t",
-              url: "u",
-              mergedAt: "2026-09-10T12:00:00Z",
-              closedAt: null,
-              updatedAt: "2026-09-10T12:00:00Z",
-              repository: { nameWithOwner: "maxi-tools/maxi-reviewer" },
-            },
-          ],
-        },
-      }),
-      '["cursor","first","name","owner","pr"]': () => ({
-        repository: {
-          pullRequest: {
-            reviewThreads: {
-              pageInfo: { hasNextPage: false, endCursor: null },
-              nodes: [
-                {
-                  id: "T1",
-                  isResolved: false,
-                  path: "crates/x/src/lib.rs",
-                  line: 4,
-                  comments: {
-                    nodes: [
-                      {
-                        author: { login: "coderabbitai" },
-                        createdAt: "2026-09-10T00:00:00Z",
-                        databaseId: 1,
-                      },
-                    ],
+    const octokit = makeOctokit(
+      {
+        HarvestPulls: () => ({
+          search: {
+            pageInfo: { hasNextPage: false, endCursor: null },
+            nodes: [
+              {
+                number: 7,
+                title: "t",
+                url: "u",
+                mergedAt: "2026-09-10T12:00:00Z",
+                closedAt: null,
+                updatedAt: "2026-09-10T12:00:00Z",
+                repository: { nameWithOwner: "maxi-tools/maxi-reviewer" },
+              },
+            ],
+          },
+        }),
+        HarvestThreads: () => ({
+          repository: {
+            pullRequest: {
+              reviewThreads: {
+                pageInfo: { hasNextPage: false, endCursor: null },
+                nodes: [
+                  {
+                    id: "T1",
+                    isResolved: false,
+                    path: "crates/x/src/lib.rs",
+                    line: 4,
+                    comments: {
+                      nodes: [
+                        {
+                          author: { login: "coderabbitai" },
+                          createdAt: "2026-09-10T00:00:00Z",
+                          databaseId: 1,
+                        },
+                      ],
+                    },
                   },
-                },
-                {
-                  id: "T2",
-                  isResolved: true,
-                  path: "scripts/run.sh",
-                  line: 9,
-                  comments: {
-                    nodes: [
-                      {
-                        author: { login: "maxi-reviewer" },
-                        createdAt: "2026-09-10T00:01:00Z",
-                        databaseId: 2,
-                      },
-                    ],
+                  {
+                    id: "T2",
+                    isResolved: true,
+                    path: "scripts/run.sh",
+                    line: 9,
+                    comments: {
+                      nodes: [
+                        {
+                          author: { login: "maxi-reviewer" },
+                          createdAt: "2026-09-10T00:01:00Z",
+                          databaseId: 2,
+                        },
+                      ],
+                    },
                   },
-                },
-                {
-                  id: "T3",
-                  isResolved: false,
-                  path: "crates/x/src/lib.rs",
-                  line: 7,
-                  comments: {
-                    nodes: [
-                      {
-                        author: { login: "codacy-production" },
-                        createdAt: "2026-09-10T00:02:00Z",
-                        databaseId: 3,
-                      },
-                    ],
+                  {
+                    id: "T3",
+                    isResolved: false,
+                    path: "crates/x/src/lib.rs",
+                    line: 7,
+                    comments: {
+                      nodes: [
+                        {
+                          author: { login: "codacy-production" },
+                          createdAt: "2026-09-10T00:02:00Z",
+                          databaseId: 3,
+                        },
+                      ],
+                    },
                   },
-                },
-              ],
+                ],
+              },
             },
           },
-        },
-      }),
-      '["cursor","expr","first","name","owner"]': () => ({
-        repository: {
-          object: {
-            history: {
-              pageInfo: { hasNextPage: false, endCursor: null },
-              nodes: [
-                {
-                  oid: "a",
-                  authoredDate: "2026-09-10T00:30:00Z",
-                  committedDate: "2026-09-10T00:30:00Z",
-                  changedFiles: {
-                    nodes: [{ path: "crates/x/src/lib.rs" }],
+        }),
+        // Keyed by operation: HarvestThreads and HarvestCommitPaths take the
+        // same variables, so a variable-name key cannot tell them apart.
+        HarvestCommitPaths: () => ({
+          repository: {
+            pullRequest: {
+              commits: {
+                pageInfo: { hasNextPage: false, endCursor: null },
+                nodes: [
+                  {
+                    commit: {
+                      oid: "a",
+                      authoredDate: "2026-09-10T00:30:00Z",
+                      committedDate: "2026-09-10T00:30:00Z",
+                    },
                   },
-                },
-              ],
+                ],
+              },
             },
           },
-        },
-      }),
-    });
+        }),
+      },
+      { a: ["crates/x/src/lib.rs"] }
+    );
 
     const result = await harvest(octokit as never, "maxi-tools", 30, {
       maxPulls: 5,
@@ -442,58 +509,52 @@ describe("harvest", () => {
     // This fixture is the canonical accepted case: the bot commented, the
     // author pushed a commit touching that file, and then the thread was
     // resolved. It must read as `accepted`, not `dismissed`.
-    let commitPages = 0;
-    const octokit = makeOctokit({
-      '["cursor","first","searchQuery"]': () => ({
-        search: {
-          pageInfo: { hasNextPage: false, endCursor: null },
-          nodes: [
-            {
-              number: 7,
-              title: "t",
-              url: "u",
-              mergedAt: "2026-09-10T12:00:00Z",
-              closedAt: null,
-              updatedAt: "2026-09-10T12:00:00Z",
-              repository: { nameWithOwner: "maxi-tools/maxi-reviewer" },
-            },
-          ],
-        },
-      }),
-      // The thread walk and the commit walk share a variable-key signature,
-      // so the fixture serves the threads first and the commits second.
-      '["cursor","first","name","owner","pr"]': () => {
-        commitPages += 1;
-        if (commitPages === 1) {
-          return {
-            repository: {
-              pullRequest: {
-                reviewThreads: {
-                  pageInfo: { hasNextPage: false, endCursor: null },
-                  nodes: [
-                    {
-                      id: "T1",
-                      // Resolved: the author fixed it and closed the thread.
-                      isResolved: true,
-                      path: "crates/x/src/lib.rs",
-                      line: 4,
-                      comments: {
-                        nodes: [
-                          {
-                            author: { login: "coderabbitai" },
-                            createdAt: "2026-09-10T00:00:00Z",
-                            databaseId: 1,
-                          },
-                        ],
-                      },
+    const octokit = makeOctokit(
+      {
+        HarvestPulls: () => ({
+          search: {
+            pageInfo: { hasNextPage: false, endCursor: null },
+            nodes: [
+              {
+                number: 7,
+                title: "t",
+                url: "u",
+                mergedAt: "2026-09-10T12:00:00Z",
+                closedAt: null,
+                updatedAt: "2026-09-10T12:00:00Z",
+                repository: { nameWithOwner: "maxi-tools/maxi-reviewer" },
+              },
+            ],
+          },
+        }),
+        HarvestThreads: () => ({
+          repository: {
+            pullRequest: {
+              reviewThreads: {
+                pageInfo: { hasNextPage: false, endCursor: null },
+                nodes: [
+                  {
+                    id: "T1",
+                    // Resolved: the author fixed it and closed the thread.
+                    isResolved: true,
+                    path: "crates/x/src/lib.rs",
+                    line: 4,
+                    comments: {
+                      nodes: [
+                        {
+                          author: { login: "coderabbitai" },
+                          createdAt: "2026-09-10T00:00:00Z",
+                          databaseId: 1,
+                        },
+                      ],
                     },
-                  ],
-                },
+                  },
+                ],
               },
             },
-          };
-        }
-        return {
+          },
+        }),
+        HarvestCommitPaths: () => ({
           repository: {
             pullRequest: {
               commits: {
@@ -504,18 +565,17 @@ describe("harvest", () => {
                       oid: "fix",
                       authoredDate: "2026-09-10T02:00:00Z",
                       committedDate: "2026-09-10T02:00:00Z",
-                      changedFilesIfAvailable: {
-                        nodes: [{ path: "crates/x/src/lib.rs" }],
-                      },
                     },
                   },
                 ],
               },
             },
           },
-        };
+        }),
       },
-    });
+      // The commit's changed files, in the shape REST actually returns.
+      { fix: ["crates/x/src/lib.rs"] }
+    );
 
     const result = await harvest(octokit as never, "maxi-tools", 30, {
       maxPulls: 5,
@@ -534,7 +594,7 @@ describe("harvest", () => {
 
   it("returns zero findings when no PRs match", async () => {
     const octokit = makeOctokit({
-      '["cursor","first","searchQuery"]': () => ({
+      HarvestPulls: () => ({
         search: {
           pageInfo: { hasNextPage: false, endCursor: null },
           nodes: [],
@@ -614,24 +674,41 @@ describe("harvest", () => {
 describe("listCommitsAfter pagination", () => {
   it("walks multiple history pages and stops when the path set is full", async () => {
     let pages = 0;
-    const octokit = makeOctokit({
-      '["cursor","first","name","owner","pr"]': () => {
-        pages += 1;
-        if (pages === 1) {
+    const octokit = makeOctokit(
+      {
+        HarvestCommitPaths: () => {
+          pages += 1;
+          if (pages === 1) {
+            return {
+              repository: {
+                pullRequest: {
+                  commits: {
+                    pageInfo: { hasNextPage: true, endCursor: "c2" },
+                    nodes: [
+                      {
+                        commit: {
+                          oid: "a",
+                          authoredDate: "2026-09-10T00:30:00Z",
+                          committedDate: "2026-09-10T00:30:00Z",
+                        },
+                      },
+                    ],
+                  },
+                },
+              },
+            };
+          }
           return {
             repository: {
               pullRequest: {
                 commits: {
-                  pageInfo: { hasNextPage: true, endCursor: "c2" },
+                  pageInfo: { hasNextPage: false, endCursor: null },
                   nodes: [
                     {
                       commit: {
-                        oid: "a",
-                        authoredDate: "2026-09-10T00:30:00Z",
-                        committedDate: "2026-09-10T00:30:00Z",
-                        changedFilesIfAvailable: {
-                          nodes: [{ path: "src/a.ts" }, { path: "src/b.ts" }],
-                        },
+                        oid: "b",
+                        authoredDate: "2026-09-10T00:31:00Z",
+                        committedDate: "2026-09-10T00:31:00Z",
                       },
                     },
                   ],
@@ -639,31 +716,11 @@ describe("listCommitsAfter pagination", () => {
               },
             },
           };
-        }
-        return {
-          repository: {
-            pullRequest: {
-              commits: {
-                pageInfo: { hasNextPage: false, endCursor: null },
-                nodes: [
-                  {
-                    commit: {
-                      oid: "b",
-                      authoredDate: "2026-09-10T00:31:00Z",
-                      committedDate: "2026-09-10T00:31:00Z",
-                      changedFilesIfAvailable: {
-                        nodes: [{ path: "src/c.ts" }],
-                      },
-                    },
-                  },
-                ],
-              },
-            },
-          },
-        };
+        },
       },
-    });
-    const commits = await listCommitsAfter(
+      { a: ["src/a.ts", "src/b.ts"], b: ["src/c.ts"] }
+    );
+    const walk = await listCommitsAfter(
       octokit as never,
       {
         owner: "maxi-tools",
@@ -675,37 +732,37 @@ describe("listCommitsAfter pagination", () => {
       2000,
       200
     );
-    expect(commits.map((c) => c.paths).flat()).toEqual(
+    expect(walk.commits.map((c) => c.paths).flat()).toEqual(
       expect.arrayContaining(["src/a.ts", "src/b.ts", "src/c.ts"])
     );
     expect(pages).toBe(2);
   });
 
   it("caps at the commit ceiling when a branch has unbounded history", async () => {
-    const octokit = makeOctokit({
-      '["cursor","first","name","owner","pr"]': () => ({
-        repository: {
-          pullRequest: {
-            commits: {
-              pageInfo: { hasNextPage: true, endCursor: "c2" },
-              nodes: [
-                {
-                  commit: {
-                    oid: "a",
-                    authoredDate: "2026-09-10T00:30:00Z",
-                    committedDate: "2026-09-10T00:30:00Z",
-                    changedFilesIfAvailable: {
-                      nodes: [{ path: "src/a.ts" }],
+    const octokit = makeOctokit(
+      {
+        HarvestCommitPaths: () => ({
+          repository: {
+            pullRequest: {
+              commits: {
+                pageInfo: { hasNextPage: true, endCursor: "c2" },
+                nodes: [
+                  {
+                    commit: {
+                      oid: "a",
+                      authoredDate: "2026-09-10T00:30:00Z",
+                      committedDate: "2026-09-10T00:30:00Z",
                     },
                   },
-                },
-              ],
+                ],
+              },
             },
           },
-        },
-      }),
-    });
-    const commits = await listCommitsAfter(
+        }),
+      },
+      { a: ["src/a.ts", "src/b.ts"] }
+    );
+    const walk = await listCommitsAfter(
       octokit as never,
       {
         owner: "maxi-tools",
@@ -717,7 +774,7 @@ describe("listCommitsAfter pagination", () => {
       2000,
       1
     );
-    expect(commits[0]?.paths).toContain("src/a.ts");
+    expect(walk.commits[0]?.paths).toContain("src/a.ts");
   });
 });
 
@@ -731,7 +788,7 @@ describe("runScheduledHarvest", () => {
         string,
         (vars: Record<string, unknown>) => unknown
       > = {
-        '["cursor","first","searchQuery"]': () => ({
+        HarvestPulls: () => ({
           search: {
             pageInfo: { hasNextPage: false, endCursor: null },
             nodes: [
@@ -747,7 +804,7 @@ describe("runScheduledHarvest", () => {
             ],
           },
         }),
-        '["cursor","first","name","owner","pr"]': () => ({
+        HarvestThreads: () => ({
           repository: {
             pullRequest: {
               reviewThreads: {
@@ -773,15 +830,50 @@ describe("runScheduledHarvest", () => {
             },
           },
         }),
+        HarvestCommitPaths: () => ({
+          repository: {
+            pullRequest: {
+              commits: {
+                pageInfo: { hasNextPage: false, endCursor: null },
+                nodes: [
+                  {
+                    commit: {
+                      oid: "c1",
+                      authoredDate: "2026-09-10T06:00:00Z",
+                      committedDate: "2026-09-10T06:00:00Z",
+                    },
+                  },
+                ],
+              },
+            },
+          },
+        }),
         '["issue_number","owner","per_page","repo"]': () => ({ data: [] }),
       };
       return {
-        graphql: vi.fn(async (_q: string, vars: Record<string, unknown>) => {
+        graphql: vi.fn(async (q: string, vars: Record<string, unknown>) => {
+          // Operation-keyed, same as makeOctokit: HarvestThreads and
+          // HarvestCommitPaths are indistinguishable by variable name.
+          const op = /query\s+(\w+)/.exec(q)?.[1];
           const key = JSON.stringify(Object.keys(vars).sort());
-          const handler = handlers[key];
-          if (!handler) throw new Error(`Unexpected graphql call: ${key}`);
+          const handler =
+            (op !== undefined ? handlers[op] : undefined) ?? handlers[key];
+          if (!handler) {
+            throw new Error(
+              `Unexpected graphql call: operation=${op ?? "?"} vars=${key}`
+            );
+          }
           return handler(vars);
         }),
+        rest: {
+          // Paths come from REST now; without this the commit walk is
+          // incomplete and every finding is classified `unknown`.
+          repos: {
+            getCommit: vi.fn(async () => ({
+              data: { files: [{ filename: "crates/x/src/lib.rs" }] },
+            })),
+          },
+        },
       };
     });
 
@@ -800,9 +892,18 @@ describe("runScheduledHarvest", () => {
       });
       expect(result.profiles.windowDays).toBe(30);
       expect(result.profiles.reviewers["coderabbitai"].overall.n).toBe(1);
+      // The fixture's commit touches the commented file after the comment,
+      // so the finding is `accepted`. This asserted 0 before, which passed
+      // only because the commit walk was failing and every finding fell
+      // through to `dismissed` — the test agreed with the bug.
       expect(result.profiles.reviewers["coderabbitai"].overall.acceptRate).toBe(
+        1
+      );
+      // And nothing was silently unmeasurable.
+      expect(result.profiles.reviewers["coderabbitai"].overall.unknownN).toBe(
         0
       );
+      expect(result.degradedPulls).toBe(0);
 
       const written = JSON.parse(
         await import("node:fs/promises").then((m) =>
@@ -827,5 +928,403 @@ describe("runScheduledHarvest", () => {
         m.rm(tmpDir, { recursive: true })
       );
     }
+  });
+});
+
+describe("a failed measurement is never published as data", () => {
+  // The three properties that, together, make the #133 failure mode
+  // impossible to ship again. Each one alone was insufficient: the query bug
+  // was real, but what let it reach production for weeks was that a failed
+  // fetch was indistinguishable from a measurement of zero.
+
+  function pullsOnly() {
+    return {
+      HarvestPulls: () => ({
+        search: {
+          pageInfo: { hasNextPage: false, endCursor: null },
+          nodes: [
+            {
+              number: 7,
+              title: "t",
+              url: "u",
+              mergedAt: "2026-09-10T12:00:00Z",
+              closedAt: null,
+              updatedAt: "2026-09-10T12:00:00Z",
+              repository: { nameWithOwner: "maxi-tools/maxi-reviewer" },
+            },
+          ],
+        },
+      }),
+      HarvestThreads: () => ({
+        repository: {
+          pullRequest: {
+            reviewThreads: {
+              pageInfo: { hasNextPage: false, endCursor: null },
+              nodes: [
+                {
+                  id: "T1",
+                  isResolved: true,
+                  path: "crates/x/src/lib.rs",
+                  line: 4,
+                  comments: {
+                    nodes: [
+                      {
+                        author: { login: "coderabbitai" },
+                        createdAt: "2026-09-10T00:00:00Z",
+                        databaseId: 1,
+                      },
+                    ],
+                  },
+                },
+              ],
+            },
+          },
+        },
+      }),
+    };
+  }
+
+  it("does not select subfields on changedFilesIfAvailable", () => {
+    // The exact regression. `Commit.changedFilesIfAvailable` is an Int in
+    // GitHub's schema — a count, null when GitHub cannot compute it — so
+    // selecting `{ nodes { path } }` on it makes the server reject the whole
+    // document:
+    //
+    //   Selections can't be made on scalars (field
+    //   'changedFilesIfAvailable' returns Int but has selections ["nodes"])
+    //
+    // Asserted against the query TEXT because no unit test can reach the
+    // real schema, and the fixtures cannot catch it: a fixture is written to
+    // match the code, so it agreed with the bug.
+    const source = readFileSync(
+      new URL("../src/reviewer-profile-build.ts", import.meta.url),
+      "utf8"
+    );
+    // Comments stripped first: the doc comment on `listCommitsAfter` quotes
+    // the broken selection deliberately, to explain it. Asserting over the
+    // raw file would make this test fail on its own documentation and teach
+    // the next reader to delete the explanation.
+    const code = source
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .replace(/^\s*\/\/.*$/gm, "");
+    expect(code).not.toMatch(/changedFilesIfAvailable\s*[({]/);
+    expect(code).not.toMatch(/changedFiles\s*\{/);
+    // And the explanation is still there, so this test's reason survives.
+    expect(source).toMatch(/Selections can't be made on scalars/);
+  });
+
+  it("classifies a finding as unknown when the commit walk fails", async () => {
+    // Not `dismissed`. An empty touched-paths list from a FAILED fetch means
+    // "we could not look", and reading it as "nothing was touched" invents a
+    // verdict against the reviewer out of a network error.
+    const octokit = makeOctokit(pullsOnly());
+    // No HarvestCommitPaths handler and no commitFiles: the walk throws.
+    const result = await harvest(octokit as never, "maxi-tools", 30, {
+      maxPulls: 5,
+      maxThreadsPerPull: 10,
+      maxCommitsPerPull: 50,
+    }).catch((err: unknown) => err);
+
+    // A single PR that wholly failed is a wholly failed harvest, which must
+    // throw rather than publish.
+    expect(result).toBeInstanceOf(Error);
+    expect(String(result)).toMatch(/failed harvest, not an empty one/);
+  });
+
+  it("keeps unknown findings out of the accept rate entirely", () => {
+    const base = {
+      reviewer: "coderabbitai" as const,
+      repo: "maxi-tools/maxi-reviewer",
+      prNumber: 1,
+      path: "crates/x/src/lib.rs",
+      line: 4,
+    };
+    const profiles = aggregateReviewerProfiles(
+      [
+        // One genuinely accepted.
+        {
+          ...base,
+          threadResolved: true,
+          subsequentTouchedPaths: ["crates/x/src/lib.rs"],
+          touchedPathsKnown: true,
+        },
+        // One unmeasurable. It must not drag the rate toward zero.
+        {
+          ...base,
+          threadResolved: true,
+          subsequentTouchedPaths: [],
+          touchedPathsKnown: false,
+        },
+      ],
+      "2026-09-19T00:00:00.000Z",
+      30
+    );
+    const overall = profiles.reviewers["coderabbitai"].overall;
+    expect(overall.n).toBe(1);
+    expect(overall.acceptRate).toBe(1);
+    expect(overall.unknownN).toBe(1);
+  });
+
+  it("reports unknown outcomes rather than silently dropping them", () => {
+    expect(
+      classifyOutcome({
+        reviewer: "coderabbitai",
+        repo: "maxi-tools/maxi-reviewer",
+        prNumber: 1,
+        path: "a.ts",
+        line: 1,
+        threadResolved: true,
+        subsequentTouchedPaths: [],
+        touchedPathsKnown: false,
+      })
+    ).toBe("unknown");
+    // The same finding with a KNOWN empty walk is a real `dismissed`.
+    expect(
+      classifyOutcome({
+        reviewer: "coderabbitai",
+        repo: "maxi-tools/maxi-reviewer",
+        prNumber: 1,
+        path: "a.ts",
+        line: 1,
+        threadResolved: true,
+        subsequentTouchedPaths: [],
+        touchedPathsKnown: true,
+      })
+    ).toBe("dismissed");
+  });
+});
+
+describe("truncation and partial failure are reported, not hidden", () => {
+  // Review on #134 found three holes in the #133 fix itself -- each one the
+  // same shape it was written to close: an incomplete result presented as a
+  // complete one.
+
+  const PULL = {
+    owner: "maxi-tools",
+    repo: "maxi-reviewer",
+    number: 1,
+    terminusAt: "2026-09-10T01:00:00Z",
+    updatedAt: "2026-09-10T01:00:00Z",
+  };
+
+  function commitNode(oid: string, date: string) {
+    return {
+      commit: { oid, authoredDate: date, committedDate: date },
+    };
+  }
+
+  it("flags truncation when the cap is hit mid-page on the LAST page", async () => {
+    // hasNextPage is FALSE, so the old code broke out before its truncation
+    // check and reported complete=true -- while silently dropping the third
+    // commit on this page.
+    const octokit = makeOctokit(
+      {
+        HarvestCommitPaths: () => ({
+          repository: {
+            pullRequest: {
+              commits: {
+                pageInfo: { hasNextPage: false, endCursor: null },
+                nodes: [
+                  commitNode("c3", "2026-09-10T03:00:00Z"),
+                  commitNode("c2", "2026-09-10T02:00:00Z"),
+                  commitNode("c1", "2026-09-10T01:00:00Z"),
+                ],
+              },
+            },
+          },
+        }),
+      },
+      { c3: ["a.ts"], c2: ["b.ts"] }
+    );
+    const walk = await listCommitsAfter(octokit as never, PULL, 2000, 2);
+    expect(walk.commits).toHaveLength(2);
+    expect(walk.complete).toBe(false);
+  });
+
+  it("flags truncation when hasNextPage is true but the cursor is null", async () => {
+    // More commits exist and there is no way to reach them. Reported as
+    // finished before.
+    const octokit = makeOctokit(
+      {
+        HarvestCommitPaths: () => ({
+          repository: {
+            pullRequest: {
+              commits: {
+                pageInfo: { hasNextPage: true, endCursor: null },
+                nodes: [commitNode("c1", "2026-09-10T01:00:00Z")],
+              },
+            },
+          },
+        }),
+      },
+      { c1: ["a.ts"] }
+    );
+    const walk = await listCommitsAfter(octokit as never, PULL, 2000, 50);
+    expect(walk.complete).toBe(false);
+  });
+
+  it("still answers a thread whose commits were all walked, on a truncated walk", async () => {
+    // Truncation drops the OLDEST commits. A thread whose slice closes --
+    // i.e. we saw a commit older than it -- has a complete answer regardless.
+    // Bailing on `!walk.complete` threw away every thread on a large PR,
+    // including recent ones whose commits were all present.
+    //
+    // Driven through `harvest`, deliberately. An earlier version of this
+    // test handed `subsequentTouchedPaths` and `touchedPathsKnown` straight
+    // to `classifyOutcome`, which never touches `listCommitsAfter` or
+    // `touchedPathsAfterThread` -- so restoring the bailout would not have
+    // failed it. A test that cannot fail for the behaviour it names is the
+    // defect this PR is about, one level up.
+    //
+    // maxCommitsPerPull = 3 against a page of three commits with
+    // hasNextPage true: every listed commit is kept, but MORE pages exist
+    // and are not read, so `walk.complete` is false. The thread is dated
+    // between c2 and c1, so its slice closes on c1 -- the omitted older
+    // commits cannot be after it, and the answer is complete anyway.
+    const octokit = makeOctokit(
+      {
+        HarvestPulls: () => ({
+          search: {
+            pageInfo: { hasNextPage: false, endCursor: null },
+            nodes: [
+              {
+                number: 7,
+                title: "t",
+                url: "u",
+                mergedAt: "2026-09-10T12:00:00Z",
+                closedAt: null,
+                updatedAt: "2026-09-10T12:00:00Z",
+                repository: { nameWithOwner: "maxi-tools/maxi-reviewer" },
+              },
+            ],
+          },
+        }),
+        HarvestThreads: () => ({
+          repository: {
+            pullRequest: {
+              reviewThreads: {
+                pageInfo: { hasNextPage: false, endCursor: null },
+                nodes: [
+                  {
+                    id: "T1",
+                    isResolved: true,
+                    path: "a.ts",
+                    line: 4,
+                    comments: {
+                      nodes: [
+                        {
+                          author: { login: "coderabbitai" },
+                          // Between c2 and c1: the slice closes on c1.
+                          createdAt: "2026-09-10T01:30:00Z",
+                          databaseId: 1,
+                        },
+                      ],
+                    },
+                  },
+                ],
+              },
+            },
+          },
+        }),
+        HarvestCommitPaths: () => ({
+          repository: {
+            pullRequest: {
+              commits: {
+                pageInfo: { hasNextPage: true, endCursor: "C2" },
+                nodes: [
+                  commitNode("c3", "2026-09-10T03:00:00Z"),
+                  commitNode("c2", "2026-09-10T02:00:00Z"),
+                  commitNode("c1", "2026-09-10T01:00:00Z"),
+                ],
+              },
+            },
+          },
+        }),
+      },
+      { c3: ["a.ts"], c2: ["b.ts"] }
+    );
+
+    const result = await harvest(octokit as never, "maxi-tools", 30, {
+      maxPulls: 5,
+      maxThreadsPerPull: 10,
+      maxCommitsPerPull: 3,
+    });
+
+    expect(result.findings).toHaveLength(1);
+    // The walk was truncated, but THIS thread's answer is complete.
+    expect(result.findings[0].touchedPathsKnown).toBe(true);
+    expect(classifyOutcome(result.findings[0])).toBe("accepted");
+  });
+
+  it("follows every page of a commit's changed files", async () => {
+    // `repos.getCommit` caps a response at 300 files. Reading only the first
+    // page and marking the paths known classifies a finding on a later page
+    // as `dismissed` rather than `accepted`.
+    const many = Array.from({ length: 150 }, (_, i) => `f${i}.ts`);
+    const octokit = makeOctokit(
+      {
+        HarvestCommitPaths: () => ({
+          repository: {
+            pullRequest: {
+              commits: {
+                pageInfo: { hasNextPage: false, endCursor: null },
+                nodes: [commitNode("big", "2026-09-10T02:00:00Z")],
+              },
+            },
+          },
+        }),
+      },
+      { big: many }
+    );
+    const walk = await listCommitsAfter(
+      octokit as never,
+      {
+        owner: "maxi-tools",
+        repo: "maxi-reviewer",
+        number: 1,
+        terminusAt: "2026-09-10T01:00:00Z",
+        updatedAt: "2026-09-10T01:00:00Z",
+      },
+      5000,
+      50
+    );
+    // 150 files over a 100-per-page fixture: the second page must be read.
+    expect(walk.commits[0].paths).toHaveLength(150);
+    expect(walk.commits[0].paths).toContain("f149.ts");
+    expect(walk.commits[0].pathsKnown).toBe(true);
+    expect(walk.complete).toBe(true);
+  });
+
+  it("counts a threads-leg failure as an observed, degraded PR", async () => {
+    // The commits leg was covered; this one was not. A `continue` before
+    // `observedPulls += 1` meant a threads query failing on EVERY PR yielded
+    // zero findings, zero unknowns, and an all-zero profile that the
+    // all-degraded guard never saw.
+    const octokit = makeOctokit({
+      HarvestPulls: () => ({
+        search: {
+          pageInfo: { hasNextPage: false, endCursor: null },
+          nodes: [
+            {
+              number: 7,
+              title: "t",
+              url: "u",
+              mergedAt: "2026-09-10T12:00:00Z",
+              closedAt: null,
+              updatedAt: "2026-09-10T12:00:00Z",
+              repository: { nameWithOwner: "maxi-tools/maxi-reviewer" },
+            },
+          ],
+        },
+      }),
+      HarvestThreads: () => {
+        throw new Error("pull_requests: read revoked");
+      },
+    });
+    const result = await harvest(octokit as never, "maxi-tools", 30, {
+      maxPulls: 5,
+    }).catch((err: unknown) => err);
+    expect(result).toBeInstanceOf(Error);
+    expect(String(result)).toMatch(/failed harvest, not an empty one/);
   });
 });

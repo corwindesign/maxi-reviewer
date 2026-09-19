@@ -76,7 +76,6 @@ interface GraphqlCommitPathsPage {
             oid: string;
             authoredDate: string;
             committedDate: string;
-            changedFilesIfAvailable: { nodes: Array<{ path: string }> } | null;
           };
         }>;
       };
@@ -164,11 +163,6 @@ const COMMIT_PATHS_QUERY = /* GraphQL */ `
               oid
               authoredDate
               committedDate
-              changedFilesIfAvailable(first: 100) {
-                nodes {
-                  path
-                }
-              }
             }
           }
         }
@@ -328,32 +322,122 @@ export async function listReviewThreads(
 }
 
 /**
- * Walk the commits on this PR, returning a per-PR list of `{oid,
- * committedDate, paths}` in reverse-chronological order. The list is
- * capped by `maxCommits` and `maxTouchedPaths` so a noisy branch can't run
- * the harvester out of memory.
+ * `repos.getCommit` caps a single response at 300 files. 100 per page keeps
+ * each response small; 30 pages is 3000 files, far past any real commit, so
+ * reaching the limit means something pathological rather than large.
+ */
+const COMMIT_FILE_PAGE_SIZE = 100;
+const COMMIT_FILE_PAGE_LIMIT = 30;
+
+export interface CommitPaths {
+  oid: string;
+  committedDate: string;
+  paths: string[];
+  /**
+   * Whether `paths` is a real observation for this commit.
+   *
+   * `false` means the per-commit file list could not be fetched, so an empty
+   * `paths` means "we could not look". Callers must not read it as "this
+   * commit touched nothing".
+   */
+  pathsKnown: boolean;
+}
+
+export interface CommitWalk {
+  /** Reverse-chronological, newest first. */
+  commits: CommitPaths[];
+  /**
+   * `false` when any commit in the window is missing its file list, or the
+   * walk stopped early against a cap. A finding derived from an incomplete
+   * walk is classified `unknown` rather than `dismissed`.
+   */
+  complete: boolean;
+}
+
+/**
+ * Every changed path on one commit, following the REST pagination.
  *
- * The PR's `commits` connection is used (not `repository.object`) because
- * `object(expression:)` requires a git ref (SHA, branch, or tag) — passing
- * an ISO timestamp silently returns null, which would surface as an empty
- * changed-files set on every PR. The commits connection doesn't accept a
- * date filter; instead, callers stop walking once a commit's date falls
- * before their per-thread `createdAt`.
+ * `repos.getCommit` returns at most 300 files in a single response and puts
+ * the rest behind `Link: rel="next"`. Reading only the first page and then
+ * calling the result known records an incomplete page as a complete record:
+ * a bot comment on a file that landed on page two classifies as `dismissed`
+ * rather than `accepted` — the same "partial result published as data" that
+ * #133 is about, one API boundary further down.
+ *
+ * Returns `known: false` when the page limit is reached on a full page,
+ * i.e. more files exist than this is willing to read. Extracted from
+ * `listCommitsAfter` so the paging has its own seam: it is the part that
+ * carried the bug, so it is the part worth being able to test alone.
+ */
+export async function listCommitFiles(
+  octokit: ReturnType<typeof github.getOctokit>,
+  pull: PullRef,
+  oid: string
+): Promise<{ paths: string[]; known: boolean }> {
+  const paths: string[] = [];
+  for (let page = 1; page <= COMMIT_FILE_PAGE_LIMIT; page += 1) {
+    const { data } = await octokit.rest.repos.getCommit({
+      owner: pull.owner,
+      repo: pull.repo,
+      ref: oid,
+      per_page: COMMIT_FILE_PAGE_SIZE,
+      page,
+    });
+    const files = data.files ?? [];
+    for (const f of files) paths.push(f.filename);
+    if (files.length < COMMIT_FILE_PAGE_SIZE) return { paths, known: true };
+  }
+  // Fell out of the loop on a full page: more files exist than we read.
+  core.warning(
+    `harvest: commit ${oid.slice(0, 8)} on ${pull.owner}/${pull.repo}#${pull.number} has more than ` +
+      `${COMMIT_FILE_PAGE_LIMIT * COMMIT_FILE_PAGE_SIZE} changed files; its path list is truncated`
+  );
+  return { paths, known: false };
+}
+
+/**
+ * Walk the commits on this PR, returning `{oid, committedDate, paths}` in
+ * reverse-chronological order.
+ *
+ * TWO APIs, deliberately. GraphQL supplies the commit list — it paginates
+ * cleanly and gives `committedDate`, which is what slices the window. It
+ * CANNOT supply the changed paths: `Commit.changedFilesIfAvailable` is an
+ * `Int` (a count, null when GitHub cannot compute it), not a connection, and
+ * `Commit` exposes no per-commit file list at all. Confirmed by introspecting
+ * the live schema: the only file-ish fields are `changedFiles: Int!`,
+ * `changedFilesIfAvailable: Int`, `file(path:): TreeEntry` (one path in the
+ * tree, not a diff) and `tree`.
+ *
+ * This code used to select `changedFilesIfAvailable(first: 100) { nodes { path } }`,
+ * which the server rejects outright:
+ *
+ *     Selections can't be made on scalars
+ *     (field 'changedFilesIfAvailable' returns Int but has selections ["nodes"])
+ *
+ * The whole document failed, every commit walk threw, the caller downgraded
+ * it to a warning, and `paths` was empty for every finding on every PR — so
+ * `accepted` was unreachable and all seven reviewers reported a 0% accept
+ * rate over a 270-PR window (#133).
+ *
+ * So paths come from REST `repos.getCommit`, which returns `files[].filename`.
+ * That is one request per commit, so the walk is bounded twice: only commits
+ * at or after `since` (the earliest bot thread on the PR — an older commit
+ * cannot be "after" any thread and its paths are never consulted) and never
+ * more than `maxCommits`.
  */
 export async function listCommitsAfter(
   octokit: ReturnType<typeof github.getOctokit>,
   pull: PullRef,
   maxTouchedPaths: number,
-  maxCommits: number
-): Promise<Array<{ oid: string; committedDate: string; paths: string[] }>> {
-  const commits: Array<{
-    oid: string;
-    committedDate: string;
-    paths: string[];
-  }> = [];
+  maxCommits: number,
+  since: string | null = null
+): Promise<CommitWalk> {
+  const listed: Array<{ oid: string; committedDate: string }> = [];
   let cursor: string | null = null;
-  let touchedPaths = 0;
-  while (commits.length < maxCommits && touchedPaths < maxTouchedPaths) {
+  let complete = true;
+
+  // 1. The commit list, from GraphQL.
+  while (listed.length < maxCommits) {
     const response = (await octokit.graphql(COMMIT_PATHS_QUERY, {
       owner: pull.owner,
       name: pull.repo,
@@ -362,25 +446,75 @@ export async function listCommitsAfter(
       cursor,
     })) as GraphqlCommitPathsPage;
     const conn = response.repository?.pullRequest?.commits;
-    if (!conn) break;
+    if (!conn) {
+      complete = false;
+      break;
+    }
     for (const node of conn.nodes) {
-      const paths = (node.commit.changedFilesIfAvailable?.nodes ?? []).map(
-        (f) => f.path
-      );
-      commits.push({
+      if (listed.length >= maxCommits) {
+        // Nodes remain on THIS page that we are not taking. Recorded here,
+        // before any break: the previous version only flagged truncation
+        // after the `hasNextPage` test, so hitting the cap mid-page on the
+        // LAST page dropped commits while still reporting `complete = true`.
+        complete = false;
+        break;
+      }
+      listed.push({
         oid: node.commit.oid,
         committedDate: node.commit.committedDate,
-        paths,
       });
-      touchedPaths += paths.length;
-      if (commits.length >= maxCommits) break;
-      if (touchedPaths >= maxTouchedPaths) break;
     }
     if (!conn.pageInfo.hasNextPage) break;
     cursor = conn.pageInfo.endCursor;
-    if (cursor === null) break;
+    if (cursor === null) {
+      // `hasNextPage` with no cursor: more commits exist and there is no way
+      // to reach them. Truncated, not finished.
+      complete = false;
+      break;
+    }
+    if (listed.length >= maxCommits) {
+      // More commits exist than we are willing to walk. Say so rather than
+      // letting a truncated list read as the whole history.
+      complete = false;
+      break;
+    }
   }
-  return commits;
+
+  // Newest first, so the per-thread filter can stop at the first commit
+  // older than the thread it is accumulating for.
+  listed.sort((a, b) => (a.committedDate < b.committedDate ? 1 : -1));
+
+  // 2. The paths, from REST — only for commits that can matter.
+  const commits: CommitPaths[] = [];
+  let touchedPaths = 0;
+  for (const entry of listed) {
+    if (since !== null && entry.committedDate < since) {
+      // Older than every thread on this PR: its paths are never consulted,
+      // so spending a request on it would be waste, not caution.
+      commits.push({ ...entry, paths: [], pathsKnown: true });
+      continue;
+    }
+    if (touchedPaths >= maxTouchedPaths) {
+      commits.push({ ...entry, paths: [], pathsKnown: false });
+      complete = false;
+      continue;
+    }
+    try {
+      const { paths, known } = await listCommitFiles(octokit, pull, entry.oid);
+      if (!known) complete = false;
+      commits.push({ ...entry, paths, pathsKnown: known });
+      touchedPaths += paths.length;
+    } catch (err) {
+      // One unreachable commit must not silently become "touched nothing".
+      core.warning(
+        `harvest: commit ${entry.oid.slice(0, 8)} on ${pull.owner}/${pull.repo}#${pull.number}: ${String(err)}`
+      );
+      commits.push({ ...entry, paths: [], pathsKnown: false });
+      complete = false;
+    }
+  }
+
+  return { commits, complete };
 }
 
 export interface HarvestResult {
@@ -389,6 +523,10 @@ export interface HarvestResult {
   calibration: ReturnType<typeof buildCalibrationReport>;
   /** How many maxi-reviewer `maxi.review.v1.review-artifact` payloads we successfully harvested. */
   artifactsObserved: number;
+  /** PRs whose commit walk did not complete. Their findings are `unknown`. */
+  degradedPulls: number;
+  /** PRs that contributed at least one bot finding. */
+  observedPulls: number;
 }
 
 /**
@@ -424,6 +562,8 @@ export async function harvest(
     threads: Parameters<typeof buildCalibrationReport>[0][number]["threads"];
   }> = [];
   let artifactsObserved = 0;
+  let degradedPulls = 0;
+  let observedPulls = 0;
   let pullIndex = 0;
   for (const pull of pulls) {
     pullIndex += 1;
@@ -434,6 +574,13 @@ export async function harvest(
       core.warning(
         `harvest: threads fetch failed for ${pull.owner}/${pull.repo}#${pull.number}: ${String(err)}`
       );
+      // Counted as observed AND degraded. A `continue` alone incremented
+      // nothing, so a threads leg that failed on every PR -- an expired App
+      // token, a revoked `pull_requests: read` -- produced zero findings,
+      // zero unknowns, and an all-zero profile that the all-degraded guard
+      // below never saw. The commits leg had this covered; this one did not.
+      observedPulls += 1;
+      degradedPulls += 1;
       continue;
     }
 
@@ -441,57 +588,100 @@ export async function harvest(
       (t) => t.firstAuthor && isBotReviewer(t.firstAuthor)
     );
     if (botThreads.length === 0) continue;
+    observedPulls += 1;
     core.info(
       `harvest: PR ${pullIndex}/${pulls.length} ${pull.owner}/${pull.repo}#${pull.number}: ${botThreads.length} bot threads`
     );
 
-    // Walk the PR's commits once. The list is reverse-chronological;
-    // for each thread, accumulate the paths touched after its createdAt
-    // by stopping the per-thread filter when we hit an older commit.
-    let commits: Array<{
-      oid: string;
-      committedDate: string;
-      paths: string[];
-    }> = [];
-    // Walk the commits for EVERY PR that has bot threads, not just those
-    // with an unresolved one. A resolved thread still needs the commit list
-    // to tell `accepted` (the author pushed a fix, then closed the thread)
-    // from `dismissed` (closed with no commit touching the file) — and since
-    // the merge rules require threads to be resolved before merging, gating
-    // the walk on an unresolved thread made `accepted` unreachable for
-    // nearly every merged PR. That is what produced a 0% accept rate across
-    // all seven reviewers over a 270-PR window.
+    // Walk the PR's commits once, then slice per thread. The list is
+    // reverse-chronological, so the per-thread filter stops at the first
+    // commit older than the thread it is accumulating for.
+    //
+    // Walk for EVERY PR that has bot threads, not just those with an
+    // unresolved one. A resolved thread still needs the commit list to tell
+    // `accepted` (the author pushed a fix, then closed the thread) from
+    // `dismissed` (closed with no commit touching the file) — and since the
+    // merge rules require threads to be resolved before merging, gating the
+    // walk on an unresolved thread made `accepted` unreachable for nearly
+    // every merged PR.
+    //
+    // `since` is the earliest bot thread on this PR: no commit older than
+    // that can be "after" any thread here, so its paths are never consulted
+    // and fetching them would be waste. This is what keeps the REST leg
+    // bounded.
+    const threadDates = botThreads
+      .map((t) => t.createdAt)
+      .filter((d): d is string => Boolean(d));
+    const since =
+      threadDates.length > 0
+        ? threadDates.reduce((a, b) => (a < b ? a : b))
+        : null;
+
+    let walk: CommitWalk = { commits: [], complete: false };
     try {
-      commits = await listCommitsAfter(
+      walk = await listCommitsAfter(
         octokit,
         pull,
         maxTouchedPathsPerPull,
-        maxCommitsPerPull
+        maxCommitsPerPull,
+        since
       );
     } catch (err) {
+      // The findings from this PR are still recorded, but as `unknown`:
+      // a failed walk must not be published as "nothing was touched".
       core.warning(
         `harvest: commits fetch failed for ${pull.owner}/${pull.repo}#${pull.number}: ${String(err)}`
       );
+      walk = { commits: [], complete: false };
     }
+    // `degraded` is decided AFTER the findings, on whether this PR yielded
+    // any known outcome -- not on `walk.complete`. A truncated walk that
+    // still closed every thread's slice taught us everything we needed, and
+    // counting it as degraded made a single-PR harvest of exactly that shape
+    // trip the all-degraded guard and throw.
 
-    function touchedPathsAfterThread(thread: ReviewThreadRef): string[] {
-      if (!thread.createdAt) return [];
+    function touchedPathsAfterThread(thread: ReviewThreadRef): {
+      paths: string[];
+      known: boolean;
+    } {
+      if (!thread.createdAt) return { paths: [], known: false };
       const out: string[] = [];
       // commits is reverse-chronological; once we see a commit dated
       // before the thread, no later commit is older, so we stop walking.
-      for (const c of commits) {
-        if (c.committedDate < thread.createdAt) break;
+      for (const c of walk.commits) {
+        if (c.committedDate < thread.createdAt) {
+          // The slice is CLOSED: we found a commit older than the thread, so
+          // everything after it is already in `out`. That is a complete
+          // answer for THIS thread even if the walk was truncated further
+          // back in history -- truncation drops the oldest commits, which by
+          // definition cannot be after a thread we have already passed.
+          //
+          // Bailing on `!walk.complete` up front (as this did) threw away
+          // every thread on a large PR, including recent ones whose commits
+          // were all present.
+          return { paths: out, known: true };
+        }
+        if (!c.pathsKnown) return { paths: [], known: false };
         for (const p of c.paths) {
           out.push(p);
         }
       }
-      return out;
+      // Ran off the end without closing the slice. If the walk was truncated,
+      // a commit after this thread may be among the ones we never fetched.
+      return walk.complete
+        ? { paths: out, known: true }
+        : { paths: [], known: false };
     }
 
+    let knownHere = 0;
+    let addedHere = 0;
     for (const thread of botThreads) {
       const reviewer = thread.firstAuthor;
       if (!reviewer || !isBotReviewer(reviewer)) continue;
       const path = thread.path ?? "";
+      const touched = touchedPathsAfterThread(thread);
+      addedHere += 1;
+      if (touched.known) knownHere += 1;
       findings.push({
         reviewer: reviewer as BotReviewer,
         repo: `${pull.owner}/${pull.repo}`,
@@ -499,9 +689,14 @@ export async function harvest(
         path,
         line: thread.line ?? 0,
         threadResolved: thread.isResolved,
-        subsequentTouchedPaths: touchedPathsAfterThread(thread),
+        subsequentTouchedPaths: touched.paths,
+        touchedPathsKnown: touched.known,
       });
     }
+    // Degraded means this PR taught us NOTHING -- every finding unknown --
+    // which is the state the all-degraded guard exists to catch. A PR that
+    // answered some threads and not others is partial, not blind.
+    if (addedHere > 0 && knownHere === 0) degradedPulls += 1;
 
     // Calibration harvest: pull maxi-reviewer's `review-artifact` comments off
     // this PR, decode them, and feed each into `calibration.ts`. The thread
@@ -547,7 +742,35 @@ export async function harvest(
     `harvest: calibration report produced ${calibration.byRule.length} rule groups, ${calibration.bySeverity.length} severity groups, ${calibration.byPath.length} path groups from ${artifactsObserved} artifacts`
   );
 
-  return { findings, calibration, artifactsObserved };
+  // A harvest that could not measure anything must not look like a harvest
+  // that measured zero. #133 published a profile asset reading 0% for all
+  // seven reviewers while every commit fetch was failing, and the job was
+  // green throughout — the failures were warnings and the empty result was
+  // indistinguishable from real data.
+  if (degradedPulls > 0) {
+    core.warning(
+      `harvest: ${degradedPulls}/${observedPulls} PRs had an incomplete commit walk; ` +
+        "their findings are recorded as outcome=unknown and excluded from every accept rate"
+    );
+  }
+  if (observedPulls > 0 && degradedPulls === observedPulls) {
+    // Not a warning. Every single PR failed, so the accept rates are
+    // vacuous and publishing them would put a table of zeroes in front of
+    // the router as though it were evidence.
+    throw new Error(
+      `harvest: the commit walk failed on all ${observedPulls} PRs with bot threads. ` +
+        "Every accept rate would be computed from zero observations, so this is a " +
+        "failed harvest, not an empty one. See the warnings above for the cause."
+    );
+  }
+
+  return {
+    findings,
+    calibration,
+    artifactsObserved,
+    degradedPulls,
+    observedPulls,
+  };
 }
 
 export interface RunHarvestOptions {
@@ -564,6 +787,9 @@ export interface RunHarvestResult {
   profiles: ReviewerProfiles;
   calibration: ReturnType<typeof buildCalibrationReport>;
   artifactsObserved: number;
+  /** PRs whose commit walk did not complete. See HarvestResult. */
+  degradedPulls: number;
+  observedPulls: number;
 }
 
 export async function runScheduledHarvest(
@@ -592,17 +818,41 @@ export async function runScheduledHarvest(
   const reviewersWithSamples = Object.values(profiles.reviewers).filter(
     (stats) => stats.overall.n > 0
   ).length;
+  const totalUnknown = Object.values(profiles.reviewers).reduce(
+    (sum, stats) => sum + stats.overall.unknownN,
+    0
+  );
   core.info(
     `harvest: wrote ${totalSamples} samples across ${reviewersWithSamples} bot reviewers (window=${options.windowDays}d)`
   );
+  // Report the unmeasured count next to the measured one. A reader who sees
+  // only "6358 samples" cannot tell that every one of them was unusable,
+  // which is exactly the state #133 shipped in.
+  core.info(
+    `harvest: ${totalUnknown} finding(s) had an unknown outcome and are excluded from every accept rate ` +
+      `(${result.degradedPulls}/${result.observedPulls} PRs had an incomplete commit walk)`
+  );
+  if (totalSamples === 0 && totalUnknown > 0) {
+    throw new Error(
+      `harvest: all ${totalUnknown} findings are outcome=unknown, so every accept rate ` +
+        "would be 0% over an empty denominator. Refusing to publish a profile that " +
+        "cannot be distinguished from a real measurement."
+    );
+  }
   for (const [reviewer, stats] of Object.entries(profiles.reviewers)) {
     const groups = Object.entries(stats.byPathGroup)
-      .filter(([, s]) => s.n > 0)
-      .sort((a, b) => b[1].n - a[1].n)
+      // `s.n > 0` alone would hide a group whose findings were ALL
+      // unknown, which is the state worth seeing most.
+      .filter(([, s]) => s.n > 0 || s.unknownN > 0)
+      .sort((a, b) => b[1].n + b[1].unknownN - (a[1].n + a[1].unknownN))
       .slice(0, 3);
     if (groups.length > 0) {
       const summary = groups
-        .map(([g, s]) => `${g}=${s.n}@${(s.acceptRate * 100).toFixed(0)}%`)
+        .map(
+          ([g, s]) =>
+            `${g}=${s.n}@${(s.acceptRate * 100).toFixed(0)}%` +
+            (s.unknownN > 0 ? `+${s.unknownN}?` : "")
+        )
         .join(", ");
       core.info(`harvest: ${reviewer}: ${summary}`);
     }
@@ -634,5 +884,7 @@ export async function runScheduledHarvest(
     profiles,
     calibration: result.calibration,
     artifactsObserved: result.artifactsObserved,
+    degradedPulls: result.degradedPulls,
+    observedPulls: result.observedPulls,
   };
 }

@@ -41,7 +41,23 @@ export const BOT_REVIEWERS = [
 
 export type BotReviewer = (typeof BOT_REVIEWERS)[number];
 
-export type ReviewOutcome = "accepted" | "dismissed" | "unaddressed";
+/**
+ * `unknown` is not a verdict about the finding, it is the ABSENCE of one:
+ * the paths touched after the comment could not be determined, so there is
+ * no evidence either way.
+ *
+ * It exists because the alternative is worse. Without it, a failed lookup
+ * produces an empty `subsequentTouchedPaths`, which is indistinguishable
+ * from "nothing was touched" and classifies as `dismissed` — a real verdict,
+ * against the reviewer, manufactured out of a network error. That is how a
+ * 270-PR harvest reported a 0% accept rate for all seven bot reviewers at
+ * once while every commit fetch was failing (#133).
+ *
+ * `unknown` findings are counted and reported separately; they never enter
+ * an accept rate.
+ */
+export type ReviewOutcome =
+  "accepted" | "dismissed" | "unaddressed" | "unknown";
 
 export interface InlineReviewFinding {
   /** The bot's GitHub login. Must be one of BOT_REVIEWERS. */
@@ -62,11 +78,31 @@ export interface InlineReviewFinding {
    * edit.
    */
   subsequentTouchedPaths: string[];
+  /**
+   * Whether `subsequentTouchedPaths` is a real observation.
+   *
+   * `false` means the commit walk for this PR did not complete, so an empty
+   * list means "we could not look", NOT "nothing was touched". Defaults to
+   * `true` when omitted so existing callers keep their meaning; the
+   * harvester sets it explicitly.
+   */
+  touchedPathsKnown?: boolean;
 }
 
 export interface PathGroupStats {
+  /** Findings with a KNOWN outcome. The denominator of `acceptRate`. */
   n: number;
   acceptRate: number;
+  /**
+   * Findings whose outcome could not be determined, excluded from `n` and
+   * from `acceptRate`.
+   *
+   * A consumer that ignores this field still gets a correct rate over the
+   * evidence that exists. A consumer that reads it can tell a genuine 0%
+   * from a harvest that measured nothing — which is the distinction #133
+   * was about.
+   */
+  unknownN: number;
 }
 
 export interface ReviewerStats {
@@ -187,6 +223,11 @@ export function pathGroupFor(path: string): string {
  * classifier does not look at the network.
  */
 export function classifyOutcome(finding: InlineReviewFinding): ReviewOutcome {
+  // No evidence is not evidence. If the commit walk did not complete, an
+  // empty touched-paths list means "we could not look", and reading it as
+  // "nothing was touched" would classify the finding as `dismissed` — a
+  // verdict against the reviewer invented from a failed request.
+  if (finding.touchedPathsKnown === false) return "unknown";
   const touched = finding.subsequentTouchedPaths.some(
     (p) => p === finding.path || pathGroupFor(p) === pathGroupFor(finding.path)
   );
@@ -195,15 +236,41 @@ export function classifyOutcome(finding: InlineReviewFinding): ReviewOutcome {
   return "unaddressed";
 }
 
-function statsFor(counts: { accepted: number; total: number }): PathGroupStats {
+function statsFor(counts: {
+  accepted: number;
+  total: number;
+  unknown: number;
+}): PathGroupStats {
   return {
     n: counts.total,
     acceptRate: counts.total > 0 ? counts.accepted / counts.total : 0,
+    unknownN: counts.unknown,
   };
 }
 
 function emptyStats(): PathGroupStats {
-  return { n: 0, acceptRate: 0 };
+  return { n: 0, acceptRate: 0, unknownN: 0 };
+}
+
+/** Fold one finding into a running bucket. */
+function accumulate(
+  prev: PathGroupStats,
+  outcome: ReviewOutcome
+): PathGroupStats {
+  if (outcome === "unknown") {
+    // Counted, but kept out of the numerator AND the denominator: an
+    // unmeasurable finding must not move a rate in either direction.
+    return statsFor({
+      accepted: prev.acceptRate * prev.n,
+      total: prev.n,
+      unknown: prev.unknownN + 1,
+    });
+  }
+  return statsFor({
+    accepted: prev.acceptRate * prev.n + (outcome === "accepted" ? 1 : 0),
+    total: prev.n + 1,
+    unknown: prev.unknownN,
+  });
 }
 
 /**
@@ -225,17 +292,13 @@ export function aggregateReviewerProfiles(
   for (const finding of findings) {
     const stats = reviewers[finding.reviewer];
     if (!stats) continue;
-    const accepted = classifyOutcome(finding) === "accepted" ? 1 : 0;
-    stats.overall = statsFor({
-      accepted: stats.overall.acceptRate * stats.overall.n + accepted,
-      total: stats.overall.n + 1,
-    });
+    const outcome = classifyOutcome(finding);
+    stats.overall = accumulate(stats.overall, outcome);
     const group = pathGroupFor(finding.path);
-    const prev = stats.byPathGroup[group] ?? emptyStats();
-    stats.byPathGroup[group] = statsFor({
-      accepted: prev.acceptRate * prev.n + accepted,
-      total: prev.n + 1,
-    });
+    stats.byPathGroup[group] = accumulate(
+      stats.byPathGroup[group] ?? emptyStats(),
+      outcome
+    );
   }
 
   return {
