@@ -127,6 +127,51 @@ describe("extractEmittedFindings", () => {
     expect(found[0].path).toBe("src/c.ts");
     expect(found[0].rule).toBe("code-review");
   });
+
+  it("skips a null legacy newComments element instead of throwing", () => {
+    const a = artifact({
+      summary: "s",
+      verdict: "comment",
+      resolvedCommentIds: [],
+      newComments: [
+        null,
+        {
+          file: "src/c.ts",
+          line: 9,
+          severity: "Info",
+          confidence: "Low",
+          message: "m",
+          promptForAgents: "p",
+        },
+      ],
+    });
+    const found = extractEmittedFindings(a);
+    expect(found).toHaveLength(1);
+    expect(found[0].path).toBe("src/c.ts");
+  });
+
+  it("skips a null structured comments element instead of throwing", () => {
+    const a = artifact({
+      schema: "maxi.review.v1.jules-review",
+      summary: "s",
+      verdict: "comment",
+      resolvedCommentIds: [],
+      comments: [
+        null,
+        {
+          id: "c1",
+          path: "src/d.ts",
+          line: 2,
+          severity: "High",
+          confidence: "High",
+          message: "m",
+        },
+      ],
+    });
+    const found = extractEmittedFindings(a);
+    expect(found).toHaveLength(1);
+    expect(found[0].path).toBe("src/d.ts");
+  });
 });
 
 describe("correlateOutcomes", () => {

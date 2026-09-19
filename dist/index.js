@@ -69722,6 +69722,22 @@ function validateArtifactReview(value) {
     if (!Array.isArray(record.newComments)) {
         errors.push("validatedReview.newComments must be an array");
     }
+    else {
+        record.newComments.forEach((comment, index) => {
+            const item = asRecord(comment, errors, `validatedReview.newComments[${index}]`);
+            if (!item)
+                return;
+            const prefix = `validatedReview.newComments[${index}].`;
+            requireString(item, "file", undefined, errors, prefix);
+            requirePositiveInt(item, "line", errors, prefix);
+            optionalPositiveInt(item, "startLine", errors, prefix);
+            optionalPositiveInt(item, "endLine", errors, prefix);
+            requireEnum(item, "severity", ["Info", "Warning", "High"], errors);
+            requireEnum(item, "confidence", ["Low", "Medium", "High"], errors);
+            requireString(item, "message", undefined, errors, prefix);
+            validateFix(item.fix, errors, `${prefix}fix`);
+        });
+    }
     return errors;
 }
 function validateRetention(value, errors) {
@@ -70520,7 +70536,14 @@ source, timeoutMinutes, options = {}) {
     if (!afterMessage) {
         await waitUntilSessionReady(session);
     }
-    let reviewMessage = await pollForReview(session, timeoutMinutes * 60 * 1000, afterMessage, options.onProgress, setupBudgetFor(resumed, options));
+    // One wall-clock deadline for the whole review, including every repair and
+    // retrieval round below. Each round previously requested a fresh
+    // `timeoutMinutes * 60 * 1000` budget of its own, so a slow-but-not-hung
+    // initial poll plus a repair round could together run for up to double the
+    // configured timeout instead of being bound by it.
+    const deadline = Date.now() + timeoutMinutes * 60 * 1000;
+    const remainingBudgetMs = () => Math.max(0, deadline - Date.now());
+    let reviewMessage = await pollForReview(session, remainingBudgetMs(), afterMessage, options.onProgress, setupBudgetFor(resumed, options));
     core/* info */.pq(`Collected review (${reviewMessage.length} chars)`);
     if (!reviewMessage) {
         return { reviewResult: null, sessionId: session.id };
@@ -70530,7 +70553,7 @@ source, timeoutMinutes, options = {}) {
             session,
             firstMessage: reviewMessage,
             retrieval: options.retrieval,
-            timeoutMs: timeoutMinutes * 60 * 1000,
+            timeoutMs: remainingBudgetMs(),
             onProgress: options.onProgress,
         });
     }
@@ -70545,7 +70568,7 @@ source, timeoutMinutes, options = {}) {
         validationErrors.push(`Failed to parse Jules response: ${errorMessage(err)}`);
         core/* warning */.$e(`Failed to parse Jules response; requesting same-session JSON repair: ${err}`);
         await sendSessionMessage(session, buildJsonRepairPrompt(reviewMessage, err));
-        const repairedMessage = await pollForReview(session, timeoutMinutes * 60 * 1000, reviewMessage, options.onProgress);
+        const repairedMessage = await pollForReview(session, remainingBudgetMs(), reviewMessage, options.onProgress);
         rawResponses.push(repairedMessage);
         try {
             reviewResult = parseJulesResponse(repairedMessage);
@@ -70572,7 +70595,7 @@ source, timeoutMinutes, options = {}) {
         validationErrors.push(...formatIssues);
         core/* warning */.$e(`Jules response has ${formatIssues.length} suggested-change formatting issue(s); requesting a same-session revision.`);
         await sendSessionMessage(session, buildFormatRepairPrompt(reviewResult, formatIssues));
-        const revisedMessage = await pollForReview(session, timeoutMinutes * 60 * 1000, latestReviewMessage, options.onProgress);
+        const revisedMessage = await pollForReview(session, remainingBudgetMs(), latestReviewMessage, options.onProgress);
         if (revisedMessage) {
             rawResponses.push(revisedMessage);
             try {
@@ -70597,7 +70620,7 @@ source, timeoutMinutes, options = {}) {
         const verified = await requestStructuredValidationRepair({
             session,
             latestReviewMessage,
-            timeoutMinutes,
+            timeoutMs: remainingBudgetMs(),
             verificationContext: options.verificationContext,
             onProgress: options.onProgress,
         });
@@ -70759,7 +70782,7 @@ async function requestStructuredValidationRepair(input) {
     const validationErrors = issues.map((issue) => `${issue.kind}: ${issue.message}`);
     core/* warning */.$e(`Jules structured review has ${issues.length} validation issue(s); requesting a same-session revision.`);
     await sendSessionMessage(input.session, buildReviewRepairPrompt(structuredReview, issues));
-    const revisedMessage = await pollForReview(input.session, input.timeoutMinutes * 60 * 1000, input.latestReviewMessage, input.onProgress);
+    const revisedMessage = await pollForReview(input.session, input.timeoutMs, input.latestReviewMessage, input.onProgress);
     try {
         const revisedStructuredReview = parseJulesReview(revisedMessage);
         const remainingIssues = verifyJulesReview(revisedStructuredReview, input.verificationContext);
@@ -70977,6 +71000,27 @@ function createSetupWatch(session, startedAt, budgetMs) {
         },
     };
 }
+/**
+ * Races `promise` against a timer so a hung network call cannot outlive
+ * `ms`. Without this, `session.hydrate()`/`session.history()` had no timeout
+ * of their own and a single hung call could hold the poll loop (and the
+ * runner) well past `deadline`, which is exactly the "step 12 hangs with no
+ * output" failure mode this file exists to prevent.
+ */
+function withTimeout(promise, ms, label) {
+    return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+            reject(new Error(`${label} timed out after ${ms}ms`));
+        }, Math.max(0, ms));
+        promise.then((value) => {
+            clearTimeout(timer);
+            resolve(value);
+        }, (err) => {
+            clearTimeout(timer);
+            reject(err);
+        });
+    });
+}
 async function pollForReview(session, timeoutMs, afterMessage, onProgress, 
 // Off unless a caller opts in. Only the first poll of a session is watching
 // for a setup that never finished; by the time a repair or retrieval prompt
@@ -71002,12 +71046,14 @@ setupBudgetMs = 0) {
         // poll hiccup, so it must not land in a catch that resumes waiting.
         await setupWatch.check(attempt);
         try {
-            await session.hydrate();
+            await withTimeout(session.hydrate(), deadline - Date.now(), "session.hydrate()");
             let last = "";
-            for await (const a of session.history()) {
-                if (a.type === "agentMessaged")
-                    last = a.message;
-            }
+            await withTimeout((async () => {
+                for await (const a of session.history()) {
+                    if (a.type === "agentMessaged")
+                        last = a.message;
+                }
+            })(), deadline - Date.now(), "session.history()");
             if (last) {
                 sawAgentOutput = true;
                 if (afterMessage !== undefined && last === afterMessage) {

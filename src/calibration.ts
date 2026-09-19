@@ -80,19 +80,27 @@ function reviewCommentRows(
 ): CommentRow[] {
   if (!review || typeof review !== "object") return [];
   if (Array.isArray((review as JulesReview).comments)) {
-    return (review as JulesReview).comments.map((c) => ({
-      path: c.path || "",
-      line: c.line || 0,
-      severity: String(c.severity || "Unknown"),
-      sourceFindingIds: c.sourceFindingIds,
-    }));
+    return (review as JulesReview).comments
+      .filter(
+        (c): c is NonNullable<typeof c> => c != null && typeof c === "object"
+      )
+      .map((c) => ({
+        path: c.path || "",
+        line: c.line || 0,
+        severity: String(c.severity || "Unknown"),
+        sourceFindingIds: c.sourceFindingIds,
+      }));
   }
   if (Array.isArray((review as ReviewResult).newComments)) {
-    return (review as ReviewResult).newComments.map((c) => ({
-      path: c.file || "",
-      line: c.line || 0,
-      severity: String(c.severity || "Unknown"),
-    }));
+    return (review as ReviewResult).newComments
+      .filter(
+        (c): c is NonNullable<typeof c> => c != null && typeof c === "object"
+      )
+      .map((c) => ({
+        path: c.file || "",
+        line: c.line || 0,
+        severity: String(c.severity || "Unknown"),
+      }));
   }
   return [];
 }

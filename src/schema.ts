@@ -255,6 +255,24 @@ function validateArtifactReview(value: unknown): string[] {
   }
   if (!Array.isArray(record.newComments)) {
     errors.push("validatedReview.newComments must be an array");
+  } else {
+    record.newComments.forEach((comment, index) => {
+      const item = asRecord(
+        comment,
+        errors,
+        `validatedReview.newComments[${index}]`
+      );
+      if (!item) return;
+      const prefix = `validatedReview.newComments[${index}].`;
+      requireString(item, "file", undefined, errors, prefix);
+      requirePositiveInt(item, "line", errors, prefix);
+      optionalPositiveInt(item, "startLine", errors, prefix);
+      optionalPositiveInt(item, "endLine", errors, prefix);
+      requireEnum(item, "severity", ["Info", "Warning", "High"], errors);
+      requireEnum(item, "confidence", ["Low", "Medium", "High"], errors);
+      requireString(item, "message", undefined, errors, prefix);
+      validateFix(item.fix, errors, `${prefix}fix`);
+    });
   }
   return errors;
 }
