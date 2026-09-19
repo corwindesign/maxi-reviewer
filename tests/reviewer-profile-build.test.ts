@@ -17,6 +17,7 @@ import {
   listCommitsAfter,
   runScheduledHarvest,
 } from "../src/reviewer-profile-build.js";
+import { classifyOutcome } from "../src/reviewer-profile.js";
 import { buildCalibrationReport } from "../src/calibration.js";
 import { extractReviewArtifact } from "../src/review-command.js";
 
@@ -426,6 +427,109 @@ describe("harvest", () => {
     expect(result.calibration.bySeverity).toEqual([]);
     expect(result.calibration.byPath).toEqual([]);
     expect(result.artifactsObserved).toBe(0);
+  });
+
+  it("classifies a resolved thread with a later commit on the file as accepted", async () => {
+    // Regression: `accepted` was structurally unreachable on any PR whose bot
+    // threads were ALL resolved. The commit walk was gated on
+    // `botThreads.some((t) => !t.isResolved)`, so a fully-resolved PR never
+    // fetched commits, `subsequentTouchedPaths` was always empty, and every
+    // finding fell through to `dismissed`. Because the merge rules require
+    // threads to be resolved before merging, that is the shape of nearly
+    // every merged PR — which is why a 270-PR harvest over the whole org
+    // reported a 0% accept rate for all seven bot reviewers at once.
+    //
+    // This fixture is the canonical accepted case: the bot commented, the
+    // author pushed a commit touching that file, and then the thread was
+    // resolved. It must read as `accepted`, not `dismissed`.
+    let commitPages = 0;
+    const octokit = makeOctokit({
+      '["cursor","first","searchQuery"]': () => ({
+        search: {
+          pageInfo: { hasNextPage: false, endCursor: null },
+          nodes: [
+            {
+              number: 7,
+              title: "t",
+              url: "u",
+              mergedAt: "2026-09-10T12:00:00Z",
+              closedAt: null,
+              updatedAt: "2026-09-10T12:00:00Z",
+              repository: { nameWithOwner: "maxi-tools/maxi-reviewer" },
+            },
+          ],
+        },
+      }),
+      // The thread walk and the commit walk share a variable-key signature,
+      // so the fixture serves the threads first and the commits second.
+      '["cursor","first","name","owner","pr"]': () => {
+        commitPages += 1;
+        if (commitPages === 1) {
+          return {
+            repository: {
+              pullRequest: {
+                reviewThreads: {
+                  pageInfo: { hasNextPage: false, endCursor: null },
+                  nodes: [
+                    {
+                      id: "T1",
+                      // Resolved: the author fixed it and closed the thread.
+                      isResolved: true,
+                      path: "crates/x/src/lib.rs",
+                      line: 4,
+                      comments: {
+                        nodes: [
+                          {
+                            author: { login: "coderabbitai" },
+                            createdAt: "2026-09-10T00:00:00Z",
+                            databaseId: 1,
+                          },
+                        ],
+                      },
+                    },
+                  ],
+                },
+              },
+            },
+          };
+        }
+        return {
+          repository: {
+            pullRequest: {
+              commits: {
+                pageInfo: { hasNextPage: false, endCursor: null },
+                nodes: [
+                  {
+                    commit: {
+                      oid: "fix",
+                      authoredDate: "2026-09-10T02:00:00Z",
+                      committedDate: "2026-09-10T02:00:00Z",
+                      changedFilesIfAvailable: {
+                        nodes: [{ path: "crates/x/src/lib.rs" }],
+                      },
+                    },
+                  },
+                ],
+              },
+            },
+          },
+        };
+      },
+    });
+
+    const result = await harvest(octokit as never, "maxi-tools", 30, {
+      maxPulls: 5,
+      maxThreadsPerPull: 10,
+      maxCommitsPerPull: 50,
+    });
+
+    expect(result.findings).toHaveLength(1);
+    // The commit landed after the comment and touched the commented file, so
+    // its path must reach the classifier.
+    expect(result.findings[0].subsequentTouchedPaths).toContain(
+      "crates/x/src/lib.rs"
+    );
+    expect(classifyOutcome(result.findings[0])).toBe("accepted");
   });
 
   it("returns zero findings when no PRs match", async () => {
