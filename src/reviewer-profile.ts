@@ -205,12 +205,30 @@ export function pathGroupFor(path: string): string {
 
 /**
  * Decide what happened to one inline review finding. A thread is:
- *   - "accepted" when a commit AFTER it landed touched the file. This covers
+ *   - "accepted" when a commit AFTER it landed touched THAT FILE. This covers
  *     the most common case (the author fixed the line in a follow-up commit)
  *     and the case where the comment author is satisfied by an unrelated
- *     touch to the same file. We use file-level granularity because most bot
+ *     touch to the same file. File-level, not line-level, because most bot
  *     threads do not preserve line numbers across rebases and the harvest
  *     window often spans pushes that move lines.
+ *
+ *     It compared the PATH GROUP as well until 2026-09-19, which is not what
+ *     the paragraph above has ever described. `pathGroupFor` buckets coarsely
+ *     -- every `.rs` file outside a test directory is `rust-src` -- so a
+ *     finding on `crates/a/src/foo.rs` was accepted by a later commit to
+ *     `crates/z/src/unrelated.rs`. On a Rust PR that means any subsequent
+ *     Rust commit accepted every Rust finding on the PR.
+ *
+ *     It is visible in the first harvest that produced real numbers
+ *     (2026-09-19, 6357 measured): `rust-src` was the top group for six of
+ *     seven reviewers (87-100%) while `docs`, `lockfile` and `config` sat
+ *     lowest. That ordering tracks how BROAD each bucket is, not how good
+ *     any reviewer is. Cross-group comparison was measuring the bucketer.
+ *
+ *     Rates drop after this change, and they should: the old ones counted
+ *     coincidence. Comparisons WITHIN one path group were always sound --
+ *     every reviewer in a group was scored through the same clause -- so the
+ *     routing signal survives; the absolute numbers do not.
  *   - "dismissed" when the thread was resolved with no subsequent commit on
  *     the same file. Resolved is treated as a deliberate close by either the
  *     thread author or the PR author; "no commit on the file" is the evidence
@@ -228,9 +246,7 @@ export function classifyOutcome(finding: InlineReviewFinding): ReviewOutcome {
   // "nothing was touched" would classify the finding as `dismissed` — a
   // verdict against the reviewer invented from a failed request.
   if (finding.touchedPathsKnown === false) return "unknown";
-  const touched = finding.subsequentTouchedPaths.some(
-    (p) => p === finding.path || pathGroupFor(p) === pathGroupFor(finding.path)
-  );
+  const touched = finding.subsequentTouchedPaths.includes(finding.path);
   if (touched) return "accepted";
   if (finding.threadResolved) return "dismissed";
   return "unaddressed";
