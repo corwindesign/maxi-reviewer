@@ -118,7 +118,11 @@ describe("aggregateReviewerProfiles", () => {
     expect(out.generatedAt).toBe("2026-09-18T00:00:00.000Z");
     for (const bot of BOT_REVIEWERS) {
       expect(out.reviewers[bot]).toBeDefined();
-      expect(out.reviewers[bot].overall).toEqual({ n: 0, acceptRate: 0 });
+      expect(out.reviewers[bot].overall).toEqual({
+        n: 0,
+        acceptRate: 0,
+        unknownN: 0,
+      });
     }
   });
 
