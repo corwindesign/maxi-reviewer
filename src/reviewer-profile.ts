@@ -87,6 +87,28 @@ export interface InlineReviewFinding {
    * harvester sets it explicitly.
    */
   touchedPathsKnown?: boolean;
+  /**
+   * How many commits landed on the PR after this comment was posted.
+   *
+   * `0` means the finding had no opportunity to be actioned: the PR merged
+   * or closed without another commit, so nothing about it can be read as
+   * evidence for or against the reviewer. See `classifyOutcome`.
+   *
+   * Recorded as a COUNT rather than derived from `subsequentTouchedPaths`
+   * being empty. The two are nearly equivalent -- that list is the union of
+   * every path from every later commit -- but "nearly" is the whole subject
+   * of this file: an empty array standing in for a fact nobody measured is
+   * the shape of #133. A commit that reports no files (an empty commit, or
+   * one whose file list we could not read) would make the array empty while
+   * a commit really did land, and the count says so.
+   *
+   * Optional for backwards compatibility with callers written before this
+   * existed; `undefined` means "not recorded" and preserves the old
+   * behaviour. The harvester always sets it, and "records the commit count
+   * so an un-amendable PR is measurable" in
+   * tests/reviewer-profile-build.test.ts fails if that stops being true.
+   */
+  subsequentCommitCount?: number;
 }
 
 export interface PathGroupStats {
@@ -248,6 +270,29 @@ export function classifyOutcome(finding: InlineReviewFinding): ReviewOutcome {
   if (finding.touchedPathsKnown === false) return "unknown";
   const touched = finding.subsequentTouchedPaths.includes(finding.path);
   if (touched) return "accepted";
+  // NO COMMIT COULD HAVE LANDED, so the silence says nothing.
+  //
+  // `dismissed` and `unaddressed` both mean "the author saw this and did not
+  // change the code". That reading requires the author to have been ABLE to
+  // change the code. On a PR that merged with no further commit they were
+  // not, and the strongest case is the one this org generates most: 1,237 of
+  // the 3,039 PRs merged across maxi-tools in the 30 days to 2026-09-21 --
+  // 41% -- are `maxi-config-sync/*` fan-out PRs, whose every file carries the
+  // `# maxi-config-owned ` marker that `check-owned-files.py` refuses to let
+  // a consumer touch. The only moves available are "merge exactly as
+  // generated" or "close".
+  //
+  // Scoring those as not-accepted made a reviewer's rate a function of how
+  // much fan-out traffic the window happened to contain. Worse, the CORRECT
+  // response to a finding there -- fix it at the source in maxi-config and
+  // re-fan -- produced no commit on the consumer PR, so being right and
+  // acting on it scored against the reviewer.
+  //
+  // This is the same principle as the `touchedPathsKnown` clause above, from
+  // #133: an absent observation must not become a verdict. There the paths
+  // could not be read; here there was nothing to read. Both are `unknown`,
+  // counted in `unknownN` and excluded from every accept rate.
+  if (finding.subsequentCommitCount === 0) return "unknown";
   if (finding.threadResolved) return "dismissed";
   return "unaddressed";
 }

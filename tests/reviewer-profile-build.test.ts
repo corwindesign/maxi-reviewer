@@ -1328,3 +1328,228 @@ describe("truncation and partial failure are reported, not hidden", () => {
     expect(String(result)).toMatch(/failed harvest, not an empty one/);
   });
 });
+
+describe("a PR nobody could amend is not evidence about a reviewer", () => {
+  // 41% of the merged corpus is `maxi-config-sync/*` fan-out, and a consumer
+  // cannot edit one: every file carries `# maxi-config-owned ` and
+  // check-owned-files.py fails lint-gate on any change to it. The PR merges
+  // exactly as generated or not at all, so no commit ever lands after a bot
+  // comment and no finding there can be actioned.
+  //
+  // The fixture below is that shape: a thread created AFTER the only commit
+  // on the PR. The walk succeeds -- this is not a degraded read -- and finds
+  // nothing later, which is a fact rather than a failure.
+
+  function unamendablePull(threadResolved: boolean) {
+    return {
+      HarvestPulls: () => ({
+        search: {
+          pageInfo: { hasNextPage: false, endCursor: null },
+          nodes: [
+            {
+              number: 88,
+              title: "ci: sync coverage from maxi-config",
+              url: "u",
+              mergedAt: "2026-09-21T02:00:00Z",
+              closedAt: null,
+              updatedAt: "2026-09-21T02:00:00Z",
+              repository: { nameWithOwner: "maxi-tools/maxi-lint" },
+            },
+          ],
+        },
+      }),
+      HarvestThreads: () => ({
+        repository: {
+          pullRequest: {
+            reviewThreads: {
+              pageInfo: { hasNextPage: false, endCursor: null },
+              nodes: [
+                {
+                  id: "T1",
+                  isResolved: threadResolved,
+                  path: ".github/workflows/ci.yml",
+                  line: 12,
+                  comments: {
+                    nodes: [
+                      {
+                        author: { login: "coderabbitai" },
+                        // AFTER the commit below: nothing can follow it.
+                        createdAt: "2026-09-21T01:00:00Z",
+                        databaseId: 1,
+                      },
+                    ],
+                  },
+                },
+              ],
+            },
+          },
+        },
+      }),
+      HarvestCommitPaths: () => ({
+        repository: {
+          pullRequest: {
+            commits: {
+              pageInfo: { hasNextPage: false, endCursor: null },
+              nodes: [
+                {
+                  commit: {
+                    oid: "a",
+                    authoredDate: "2026-09-21T00:00:00Z",
+                    committedDate: "2026-09-21T00:00:00Z",
+                  },
+                },
+              ],
+            },
+          },
+        },
+      }),
+    };
+  }
+
+  it("records the commit count so an un-amendable PR is measurable", async () => {
+    // The guard that keeps the classifier's new clause reachable. If the
+    // harvester ever stops setting `subsequentCommitCount`, it reads as
+    // `undefined` -- "not recorded" -- and every finding silently reverts to
+    // being scored against the reviewer. This test is the only thing that
+    // would say so.
+    const octokit = makeOctokit(unamendablePull(false), {
+      a: [".github/workflows/ci.yml"],
+    });
+    const result = await harvest(octokit as never, "maxi-tools", 30, {
+      maxPulls: 5,
+    });
+    expect(result.findings).toHaveLength(1);
+    expect(result.findings[0].subsequentCommitCount).toBe(0);
+    // Read successfully: this is NOT a degraded walk.
+    expect(result.findings[0].touchedPathsKnown).toBe(true);
+    expect(classifyOutcome(result.findings[0])).toBe("unknown");
+  });
+
+  it("scores a resolved thread on such a PR as unknown, not dismissed", async () => {
+    // On a fan-out PR the right response to a finding is to fix it at the
+    // source in maxi-config and re-fan, then resolve here with no commit.
+    // That used to be recorded as the reviewer being wrong.
+    const octokit = makeOctokit(unamendablePull(true), {
+      a: [".github/workflows/ci.yml"],
+    });
+    const result = await harvest(octokit as never, "maxi-tools", 30, {
+      maxPulls: 5,
+    });
+    expect(classifyOutcome(result.findings[0])).toBe("unknown");
+  });
+
+  it("counts it as un-amendable and NOT as degraded", async () => {
+    // The two are different facts and the report keeps them apart: a
+    // degraded PR is one we failed to read, an un-amendable one we read
+    // perfectly. Folding them together would make a healthy harvest of
+    // fan-out traffic look like a broken one, and would hide the share of
+    // the corpus that is unmeasurable -- which is how this went unnoticed
+    // until the rates had already decayed.
+    const octokit = makeOctokit(unamendablePull(false), {
+      a: [".github/workflows/ci.yml"],
+    });
+    const result = await harvest(octokit as never, "maxi-tools", 30, {
+      maxPulls: 5,
+    });
+    expect(result.observedPulls).toBe(1);
+    expect(result.unamendablePulls).toBe(1);
+    expect(result.degradedPulls).toBe(0);
+  });
+
+  it("does not call a PR un-amendable when any finding could not be read", async () => {
+    // Found in review. `knownHere > 0` was enough, so a PR with one readable
+    // zero-commit finding and one failed commit walk was labelled
+    // un-amendable on the strength of the half we could see -- a whole-PR
+    // verdict from a partial read, which is this PR's own subject one level
+    // up. Two threads here; the second has no createdAt, so its walk yields
+    // known=false.
+    const handlers = unamendablePull(false);
+    handlers.HarvestThreads = () => ({
+      repository: {
+        pullRequest: {
+          reviewThreads: {
+            pageInfo: { hasNextPage: false, endCursor: null },
+            nodes: [
+              {
+                id: "T1",
+                isResolved: false,
+                path: "a.yml",
+                line: 12,
+                comments: {
+                  nodes: [
+                    {
+                      author: { login: "coderabbitai" },
+                      createdAt: "2026-09-21T01:00:00Z",
+                      databaseId: 1,
+                    },
+                  ],
+                },
+              },
+              {
+                id: "T2",
+                isResolved: false,
+                path: "scripts/thing.sh",
+                line: 3,
+                comments: {
+                  nodes: [
+                    {
+                      author: { login: "qltysh" },
+                      // No createdAt: the walk cannot place this thread in
+                      // time, so its outcome is unknown.
+                      createdAt: "",
+                      databaseId: 2,
+                    },
+                  ],
+                },
+              },
+            ],
+          },
+        },
+      },
+    });
+    const octokit = makeOctokit(handlers, { a: ["a.yml"] });
+    const result = await harvest(octokit as never, "maxi-tools", 30, {
+      maxPulls: 5,
+    });
+    expect(result.findings).toHaveLength(2);
+    const known = result.findings.filter((f) => f.touchedPathsKnown);
+    expect(known).toHaveLength(1);
+    // The readable finding is still scored correctly on its own terms...
+    expect(classifyOutcome(known[0])).toBe("unknown");
+    // ...but the PR is NOT counted, because we did not read all of it.
+    expect(result.unamendablePulls).toBe(0);
+  });
+
+  it("keeps counting a PR that did get a later commit as amendable", async () => {
+    // The guard against over-correcting: one commit after the comment is
+    // opportunity enough, and the PR must not be counted un-amendable.
+    const handlers = unamendablePull(false);
+    handlers.HarvestCommitPaths = () => ({
+      repository: {
+        pullRequest: {
+          commits: {
+            pageInfo: { hasNextPage: false, endCursor: null },
+            nodes: [
+              {
+                commit: {
+                  oid: "b",
+                  authoredDate: "2026-09-21T01:30:00Z",
+                  committedDate: "2026-09-21T01:30:00Z",
+                },
+              },
+            ],
+          },
+        },
+      },
+    });
+    const octokit = makeOctokit(handlers, {
+      b: [".github/workflows/ci.yml"],
+    });
+    const result = await harvest(octokit as never, "maxi-tools", 30, {
+      maxPulls: 5,
+    });
+    expect(result.unamendablePulls).toBe(0);
+    expect(result.findings[0].subsequentCommitCount).toBe(1);
+    expect(classifyOutcome(result.findings[0])).toBe("accepted");
+  });
+});

@@ -525,6 +525,15 @@ export interface HarvestResult {
   artifactsObserved: number;
   /** PRs whose commit walk did not complete. Their findings are `unknown`. */
   degradedPulls: number;
+  /**
+   * PRs read successfully that merged or closed with NO commit after their
+   * first bot comment, so no finding on them could be actioned. Their
+   * findings are `unknown` too, but for the opposite reason to
+   * `degradedPulls`: not a failure to measure, an absence of anything to
+   * measure. Reported separately so the fan-out share of the corpus is
+   * visible in every run.
+   */
+  unamendablePulls: number;
   /** PRs that contributed at least one bot finding. */
   observedPulls: number;
 }
@@ -563,6 +572,7 @@ export async function harvest(
   }> = [];
   let artifactsObserved = 0;
   let degradedPulls = 0;
+  let unamendablePulls = 0;
   let observedPulls = 0;
   let pullIndex = 0;
   for (const pull of pulls) {
@@ -643,9 +653,17 @@ export async function harvest(
     function touchedPathsAfterThread(thread: ReviewThreadRef): {
       paths: string[];
       known: boolean;
+      /**
+       * Commits dated after the thread. Counted rather than inferred from
+       * `paths` being empty: a commit whose file list is empty would leave
+       * `paths` empty while a commit really did land, and the difference
+       * decides whether a finding is measurable at all.
+       */
+      commitCount: number;
     } {
-      if (!thread.createdAt) return { paths: [], known: false };
+      if (!thread.createdAt) return { paths: [], known: false, commitCount: 0 };
       const out: string[] = [];
+      let commitCount = 0;
       // commits is reverse-chronological; once we see a commit dated
       // before the thread, no later commit is older, so we stop walking.
       for (const c of walk.commits) {
@@ -659,9 +677,10 @@ export async function harvest(
           // Bailing on `!walk.complete` up front (as this did) threw away
           // every thread on a large PR, including recent ones whose commits
           // were all present.
-          return { paths: out, known: true };
+          return { paths: out, known: true, commitCount };
         }
-        if (!c.pathsKnown) return { paths: [], known: false };
+        if (!c.pathsKnown) return { paths: [], known: false, commitCount: 0 };
+        commitCount += 1;
         for (const p of c.paths) {
           out.push(p);
         }
@@ -669,12 +688,13 @@ export async function harvest(
       // Ran off the end without closing the slice. If the walk was truncated,
       // a commit after this thread may be among the ones we never fetched.
       return walk.complete
-        ? { paths: out, known: true }
-        : { paths: [], known: false };
+        ? { paths: out, known: true, commitCount }
+        : { paths: [], known: false, commitCount: 0 };
     }
 
     let knownHere = 0;
     let addedHere = 0;
+    let amendableHere = 0;
     for (const thread of botThreads) {
       const reviewer = thread.firstAuthor;
       if (!reviewer || !isBotReviewer(reviewer)) continue;
@@ -682,6 +702,7 @@ export async function harvest(
       const touched = touchedPathsAfterThread(thread);
       addedHere += 1;
       if (touched.known) knownHere += 1;
+      if (touched.known && touched.commitCount > 0) amendableHere += 1;
       findings.push({
         reviewer: reviewer as BotReviewer,
         repo: `${pull.owner}/${pull.repo}`,
@@ -691,12 +712,34 @@ export async function harvest(
         threadResolved: thread.isResolved,
         subsequentTouchedPaths: touched.paths,
         touchedPathsKnown: touched.known,
+        subsequentCommitCount: touched.commitCount,
       });
     }
     // Degraded means this PR taught us NOTHING -- every finding unknown --
     // which is the state the all-degraded guard exists to catch. A PR that
     // answered some threads and not others is partial, not blind.
     if (addedHere > 0 && knownHere === 0) degradedPulls += 1;
+    // Counted SEPARATELY from degraded, because they are different facts and
+    // the difference is the whole point. A degraded PR is one we failed to
+    // read. An un-amendable one we read perfectly: it merged with no commit
+    // after its first bot comment, so there was never an opportunity for a
+    // finding to be actioned. Both yield outcome=unknown; only one is a
+    // defect. Reporting them in a single number would make a healthy harvest
+    // of fan-out traffic look like a broken one -- and, worse, would make the
+    // fan-out share invisible, which is how it went unnoticed until the rates
+    // had already decayed.
+    //
+    // `knownHere === addedHere`, not `knownHere > 0`: EVERY finding on the
+    // PR has to be a real observation before the PR as a whole can be called
+    // un-amendable. A PR with one known zero-commit finding and one finding
+    // whose commit walk failed satisfies `knownHere > 0`, but the failed one
+    // may well have had later commits we never saw -- so calling the PR
+    // un-amendable would be a whole-PR verdict drawn from a partial read.
+    // That is the defect this PR exists to fix, one level up, in the counter
+    // added to measure it. Found in review by coderabbitai.
+    if (addedHere > 0 && knownHere === addedHere && amendableHere === 0) {
+      unamendablePulls += 1;
+    }
 
     // Calibration harvest: pull maxi-reviewer's `review-artifact` comments off
     // this PR, decode them, and feed each into `calibration.ts`. The thread
@@ -763,12 +806,24 @@ export async function harvest(
         "failed harvest, not an empty one. See the warnings above for the cause."
     );
   }
+  // Info, not a warning: this is the corpus being what it is, not anything
+  // going wrong. It is printed on EVERY run, including at zero, because the
+  // number is only useful as a trend -- a reader comparing two harvests needs
+  // to know how much of each window was measurable before comparing the
+  // rates. 41% of the merged corpus was un-amendable fan-out traffic when
+  // this was written, and nothing said so.
+  core.info(
+    `harvest: ${unamendablePulls}/${observedPulls} PRs merged or closed with no commit after their ` +
+      "first bot comment; their findings are outcome=unknown because no finding on them " +
+      "could have been actioned (fan-out PRs are un-amendable by construction)"
+  );
 
   return {
     findings,
     calibration,
     artifactsObserved,
     degradedPulls,
+    unamendablePulls,
     observedPulls,
   };
 }
@@ -789,6 +844,8 @@ export interface RunHarvestResult {
   artifactsObserved: number;
   /** PRs whose commit walk did not complete. See HarvestResult. */
   degradedPulls: number;
+  /** PRs with no commit after the first bot comment. See HarvestResult. */
+  unamendablePulls: number;
   observedPulls: number;
 }
 
@@ -830,7 +887,8 @@ export async function runScheduledHarvest(
   // which is exactly the state #133 shipped in.
   core.info(
     `harvest: ${totalUnknown} finding(s) had an unknown outcome and are excluded from every accept rate ` +
-      `(${result.degradedPulls}/${result.observedPulls} PRs had an incomplete commit walk)`
+      `(${result.degradedPulls}/${result.observedPulls} PRs had an incomplete commit walk, ` +
+      `${result.unamendablePulls}/${result.observedPulls} had no commit after the first bot comment)`
   );
   if (totalSamples === 0 && totalUnknown > 0) {
     throw new Error(
@@ -885,6 +943,7 @@ export async function runScheduledHarvest(
     calibration: result.calibration,
     artifactsObserved: result.artifactsObserved,
     degradedPulls: result.degradedPulls,
+    unamendablePulls: result.unamendablePulls,
     observedPulls: result.observedPulls,
   };
 }
