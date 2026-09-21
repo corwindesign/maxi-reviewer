@@ -1456,6 +1456,70 @@ describe("a PR nobody could amend is not evidence about a reviewer", () => {
     expect(result.degradedPulls).toBe(0);
   });
 
+  it("does not call a PR un-amendable when any finding could not be read", async () => {
+    // Found in review. `knownHere > 0` was enough, so a PR with one readable
+    // zero-commit finding and one failed commit walk was labelled
+    // un-amendable on the strength of the half we could see -- a whole-PR
+    // verdict from a partial read, which is this PR's own subject one level
+    // up. Two threads here; the second has no createdAt, so its walk yields
+    // known=false.
+    const handlers = unamendablePull(false);
+    handlers.HarvestThreads = () => ({
+      repository: {
+        pullRequest: {
+          reviewThreads: {
+            pageInfo: { hasNextPage: false, endCursor: null },
+            nodes: [
+              {
+                id: "T1",
+                isResolved: false,
+                path: "a.yml",
+                line: 12,
+                comments: {
+                  nodes: [
+                    {
+                      author: { login: "coderabbitai" },
+                      createdAt: "2026-09-21T01:00:00Z",
+                      databaseId: 1,
+                    },
+                  ],
+                },
+              },
+              {
+                id: "T2",
+                isResolved: false,
+                path: "scripts/thing.sh",
+                line: 3,
+                comments: {
+                  nodes: [
+                    {
+                      author: { login: "qltysh" },
+                      // No createdAt: the walk cannot place this thread in
+                      // time, so its outcome is unknown.
+                      createdAt: "",
+                      databaseId: 2,
+                    },
+                  ],
+                },
+              },
+            ],
+          },
+        },
+      },
+    });
+    const octokit = makeOctokit(handlers, { a: ["a.yml"] });
+    const result = await harvest(octokit as never, "maxi-tools", 30, {
+      maxPulls: 5,
+    });
+    expect(result.findings).toHaveLength(2);
+    const known = result.findings.filter((f) => f.touchedPathsKnown);
+    expect(known).toHaveLength(1);
+    // The readable finding is still scored correctly on its own terms...
+    expect(classifyOutcome(known[0])).toBe("unknown");
+    // ...but the PR is NOT counted, because we did not read all of it.
+    expect(result.unamendablePulls).toBe(0);
+  });
+
   it("keeps counting a PR that did get a later commit as amendable", async () => {
     // The guard against over-correcting: one commit after the comment is
     // opportunity enough, and the PR must not be counted un-amendable.

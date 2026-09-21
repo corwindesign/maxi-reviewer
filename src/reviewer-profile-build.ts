@@ -728,7 +728,16 @@ export async function harvest(
     // of fan-out traffic look like a broken one -- and, worse, would make the
     // fan-out share invisible, which is how it went unnoticed until the rates
     // had already decayed.
-    if (addedHere > 0 && knownHere > 0 && amendableHere === 0) {
+    //
+    // `knownHere === addedHere`, not `knownHere > 0`: EVERY finding on the
+    // PR has to be a real observation before the PR as a whole can be called
+    // un-amendable. A PR with one known zero-commit finding and one finding
+    // whose commit walk failed satisfies `knownHere > 0`, but the failed one
+    // may well have had later commits we never saw -- so calling the PR
+    // un-amendable would be a whole-PR verdict drawn from a partial read.
+    // That is the defect this PR exists to fix, one level up, in the counter
+    // added to measure it. Found in review by coderabbitai.
+    if (addedHere > 0 && knownHere === addedHere && amendableHere === 0) {
       unamendablePulls += 1;
     }
 
