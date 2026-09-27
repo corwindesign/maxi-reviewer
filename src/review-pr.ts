@@ -135,6 +135,30 @@ export function reviewTimeoutExplanation(timeoutMinutes: number): string {
   ].join(" ");
 }
 
+/** True when a review body is missing any non-whitespace content. */
+export function isBlankReviewBody(body: string): boolean {
+  return body.trim().length === 0;
+}
+
+/**
+ * Status line for a parsed review whose body is empty or whitespace-only.
+ * Distinct from a timeout: something came back, but it was not a review.
+ */
+export function emptyReviewStatus(collectedCharacters: number): string {
+  return truncate(
+    `Empty review body (${collectedCharacters} chars) — no review was produced.`,
+    STATUS_DESCRIPTION_MAX
+  );
+}
+
+/** Long-form of {@link emptyReviewStatus} for the log and the job failure. */
+export function emptyReviewExplanation(collectedCharacters: number): string {
+  return [
+    `Collected an empty or whitespace-only review body (${collectedCharacters} chars), so no review was produced.`,
+    "This is not a verdict on the code.",
+  ].join(" ");
+}
+
 export interface PullRequestContext {
   diff: string;
   changedFiles: string[];
@@ -764,6 +788,24 @@ export async function runReviewPr(
 
     const { verdict, summary, resolvedCommentIds, newComments } = reviewResult;
 
+    // A parsed result with no body is the quiet sibling of a timeout: the
+    // job used to return normally, so the Actions check stayed SUCCESS even
+    // though nothing was reviewed. fail_on=never must not paint that green.
+    if (isBlankReviewBody(summary)) {
+      await deps.setStatus(
+        octokit,
+        owner,
+        repo,
+        headSha,
+        statusContext,
+        "failure",
+        emptyReviewStatus(summary.length)
+      );
+      await deps.writeJobSummary(summary.length);
+      core.setFailed(emptyReviewExplanation(summary.length));
+      return;
+    }
+
     // Resolve threads that the LLM identified as fixed
     if (resolvedCommentIds && resolvedCommentIds.length > 0) {
       const threadIdsToResolve = context.openThreads
@@ -800,6 +842,7 @@ export async function runReviewPr(
       state,
       description
     );
+    await deps.writeJobSummary(summary.length);
 
     core.info(`Verdict: ${verdict}. Status check: ${state}.`);
   } catch (err) {

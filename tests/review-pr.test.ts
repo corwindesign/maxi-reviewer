@@ -7,7 +7,10 @@ import * as core from "@actions/core";
 import * as github from "@actions/github";
 import {
   buildArtifactCommentContent,
+  emptyReviewExplanation,
+  emptyReviewStatus,
   fetchPullRequestContext,
+  isBlankReviewBody,
   reviewTimeoutExplanation,
   reviewTimeoutStatus,
   runAnalyzers,
@@ -882,6 +885,119 @@ describe("review timeout wording", () => {
     for (const minutes of [1, 15, 1440, 35791]) {
       expect(reviewTimeoutStatus(minutes).length).toBeLessThanOrEqual(140);
     }
+  });
+});
+
+describe("empty review body is never a passing check", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.spyOn(core, "getInput").mockImplementation((name: string) => {
+      if (name === "jules_api_key") return "jules-key";
+      if (name === "github_token") return "github-token";
+      // fail_on=never is the path that used to paint an empty body SUCCESS.
+      if (name === "fail_on") return "never";
+      if (name === "timeout_minutes") return "30";
+      return "";
+    });
+    vi.spyOn(core, "getBooleanInput").mockReturnValue(false);
+    vi.spyOn(core, "setSecret").mockImplementation(() => undefined);
+    vi.spyOn(core, "info").mockImplementation(() => undefined);
+    vi.spyOn(core, "warning").mockImplementation(() => undefined);
+    vi.spyOn(core, "error").mockImplementation(() => undefined);
+    vi.spyOn(core, "setFailed").mockImplementation(() => undefined);
+
+    (github as any).getOctokit = vi.fn().mockReturnValue({ rest: {} });
+    (github as any).context = {
+      runId: 101,
+      runAttempt: 1,
+      job: "review",
+      eventName: "pull_request",
+      repo: { owner: "maxi", repo: "example" },
+      payload: {
+        action: "opened",
+        pull_request: {
+          number: 7,
+          head: { sha: "head-sha", repo: { full_name: "maxi/example" } },
+          base: { sha: "base-sha", ref: "main" },
+          title: "PR title",
+          body: "PR body",
+          labels: [],
+          draft: false,
+        },
+      },
+    };
+  });
+
+  it.each([
+    { name: "empty", summary: "" },
+    { name: "whitespace-only", summary: "  \n\t  " },
+  ])(
+    "fails the job when the review body is $name",
+    async ({ summary }) => {
+      const writeJobSummary = vi.fn().mockResolvedValue(undefined);
+      const deps = {
+        ...completedReviewDeps(),
+        writeJobSummary,
+        runJulesReview: vi.fn().mockResolvedValue({
+          reviewResult: {
+            verdict: "approve",
+            summary,
+            resolvedCommentIds: [],
+            newComments: [],
+          },
+          sessionId: "session-empty",
+        }),
+      };
+
+      await runReviewPr(deps);
+
+      expect(deps.submitReview).not.toHaveBeenCalled();
+      expect(writeJobSummary).toHaveBeenCalledWith(summary.length);
+      expect(core.setFailed).toHaveBeenCalledWith(
+        emptyReviewExplanation(summary.length)
+      );
+      expect(deps.setStatus).toHaveBeenCalledWith(
+        expect.anything(),
+        "maxi",
+        "example",
+        "head-sha",
+        "",
+        "failure",
+        emptyReviewStatus(summary.length)
+      );
+      const states = deps.setStatus.mock.calls.map((call) => call[5]);
+      expect(states).not.toContain("success");
+    }
+  );
+
+  it(
+    "keeps a normal review body as a passing check when fail_on is never",
+    async () => {
+      const writeJobSummary = vi.fn().mockResolvedValue(undefined);
+      const deps = {
+        ...completedReviewDeps(),
+        writeJobSummary,
+      };
+
+      await runReviewPr(deps);
+
+      expect(deps.submitReview).toHaveBeenCalled();
+      expect(core.setFailed).not.toHaveBeenCalled();
+      expect(writeJobSummary).toHaveBeenCalledWith("Looks okay.".length);
+      const states = deps.setStatus.mock.calls.map((call) => call[5]);
+      expect(states).toContain("success");
+      expect(states).not.toContain("failure");
+    }
+  );
+});
+
+describe("isBlankReviewBody", () => {
+  it.each([
+    { name: "empty", body: "", blank: true },
+    { name: "whitespace-only", body: " \n\t", blank: true },
+    { name: "normal", body: "Looks okay.", blank: false },
+  ])("$name", ({ body, blank }) => {
+    expect(isBlankReviewBody(body)).toBe(blank);
   });
 });
 
