@@ -69701,9 +69701,10 @@ function validateReviewOutcomeMetadata(record, errors) {
         requirePositiveInt(identity, "workflowRunAttempt", errors, "runIdentity.");
         requireString(identity, "job", undefined, errors, "runIdentity.");
     }
-    if (record.outcome === "TIMED_OUT_NO_CONTENT" &&
+    if ((record.outcome === "TIMED_OUT_NO_CONTENT" ||
+        record.outcome === "EMPTY_REVIEW_BODY") &&
         record.validatedReview !== null) {
-        errors.push("TIMED_OUT_NO_CONTENT requires validatedReview to be null");
+        errors.push(`${String(record.outcome)} requires validatedReview to be null`);
     }
     if ((record.outcome === "REVIEWED_NO_FINDINGS" ||
         record.outcome === "REVIEWED_WITH_FINDINGS") &&
@@ -73745,6 +73746,8 @@ function latestReviewArtifactSessionId(comments) {
     for (const body of [...comments].reverse()) {
         const artifact = extractReviewArtifactFromComment(body);
         if (!artifact?.sessionId)
+            continue;
+        if (artifact.outcome === "EMPTY_REVIEW_BODY")
             continue;
         // Never resume a session that produced no review. A hung/stuck Jules session
         // (no responses, no validated review) would otherwise be resumed on every

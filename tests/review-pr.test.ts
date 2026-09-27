@@ -11,6 +11,7 @@ import {
   emptyReviewStatus,
   fetchPullRequestContext,
   isBlankReviewBody,
+  latestReviewArtifactSessionId,
   reviewTimeoutExplanation,
   reviewTimeoutStatus,
   runAnalyzers,
@@ -25,6 +26,7 @@ vi.mock("@actions/github");
 function artifactComment(input: {
   headSha: string;
   sessionId?: string;
+  outcome?: "EMPTY_REVIEW_BODY";
 }): string {
   const encoded = Buffer.from(
     JSON.stringify({
@@ -40,15 +42,30 @@ function artifactComment(input: {
       headSha: input.headSha,
       baseSha: "base-sha",
       analyzerFindings: [],
-      rawJulesResponses: [],
-      validatedReview: {
-        schema: "maxi.review.v1.jules-review",
-        summary: "Review summary.",
-        verdict: "approve",
-        resolvedCommentIds: [],
-        comments: [],
-      },
+      rawJulesResponses: input.outcome ? ["partial response"] : [],
+      validatedReview: input.outcome
+        ? null
+        : {
+            schema: "maxi.review.v1.jules-review",
+            summary: "Review summary.",
+            verdict: "approve",
+            resolvedCommentIds: [],
+            comments: [],
+          },
       validationErrors: [],
+      ...(input.outcome
+        ? {
+            outcomeSchema: "maxi.review.v1.review-outcome",
+            outcome: input.outcome,
+            outcomeReason: "No review body was produced",
+            reviewOutputChars: 16,
+            runIdentity: {
+              workflowRunId: 101,
+              workflowRunAttempt: 1,
+              job: "review",
+            },
+          }
+        : {}),
       ...(input.sessionId ? { sessionId: input.sessionId } : {}),
     }),
     "utf8"
@@ -1098,6 +1115,21 @@ describe("empty review body is never a passing check", () => {
     const states = deps.setStatus.mock.calls.map((call) => call[5]);
     expect(states).toContain("success");
     expect(states).not.toContain("failure");
+  });
+});
+
+describe("empty review artifact session resumption", () => {
+  it("skips a blank-body session with raw responses and reuses the last valid session", () => {
+    expect(
+      latestReviewArtifactSessionId([
+        artifactComment({ headSha: "older", sessionId: "valid-session" }),
+        artifactComment({
+          headSha: "newer",
+          sessionId: "empty-session",
+          outcome: "EMPTY_REVIEW_BODY",
+        }),
+      ])
+    ).toBe("valid-session");
   });
 });
 
