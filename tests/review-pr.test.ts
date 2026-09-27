@@ -113,8 +113,10 @@ describe("runReviewPr orchestration", () => {
     vi.spyOn(core, "error").mockImplementation(() => undefined);
     vi.spyOn(core, "setFailed").mockImplementation(() => undefined);
 
-    (github as any).getOctokit = vi.fn().mockReturnValue({ rest: {} });
-    (github as any).context = {
+    vi.mocked(github.getOctokit).mockReturnValue({ rest: {} } as ReturnType<
+      typeof github.getOctokit
+    >);
+    (github as typeof github & { context: typeof github.context }).context = {
       runId: 101,
       runAttempt: 1,
       job: "review",
@@ -906,8 +908,10 @@ describe("empty review body is never a passing check", () => {
     vi.spyOn(core, "error").mockImplementation(() => undefined);
     vi.spyOn(core, "setFailed").mockImplementation(() => undefined);
 
-    (github as any).getOctokit = vi.fn().mockReturnValue({ rest: {} });
-    (github as any).context = {
+    vi.mocked(github.getOctokit).mockReturnValue({ rest: {} } as ReturnType<
+      typeof github.getOctokit
+    >);
+    (github as typeof github & { context: typeof github.context }).context = {
       runId: 101,
       runAttempt: 1,
       job: "review",
@@ -950,6 +954,10 @@ describe("empty review body is never a passing check", () => {
     await runReviewPr(deps);
 
     expect(deps.submitReview).not.toHaveBeenCalled();
+    const artifact = JSON.parse(deps.uploadArtifact.mock.calls[0][1]);
+    expect(artifact.outcome).toBe("EMPTY_REVIEW_BODY");
+    expect(artifact.outcomeReason).toBe(emptyReviewExplanation(summary.length));
+    expect(artifact.validatedReview).toBeNull();
     expect(writeJobSummary).toHaveBeenCalledWith(summary.length);
     expect(core.setFailed).toHaveBeenCalledWith(
       emptyReviewExplanation(summary.length)
@@ -965,6 +973,73 @@ describe("empty review body is never a passing check", () => {
     );
     const states = deps.setStatus.mock.calls.map((call) => call[5]);
     expect(states).not.toContain("success");
+  });
+
+  it("publishes findings and resolves threads despite a blank summary", async () => {
+    const finding = {
+      file: "src/a.ts",
+      line: 1,
+      severity: "Warning" as const,
+      confidence: "High" as const,
+      message: "Fix this",
+      promptForAgents: "Fix this",
+    };
+    const deps = {
+      ...completedReviewDeps(),
+      writeJobSummary: vi.fn().mockResolvedValue(undefined),
+      fetchPullRequestContext: vi.fn().mockResolvedValue({
+        diff: "",
+        changedFiles: ["src/a.ts"],
+        files: new Map(),
+        changedLines: new Map(),
+        openThreads: [{ index: 1, threadId: "thread-1" }],
+        linkedIssues: [],
+      }),
+      runJulesReview: vi.fn().mockResolvedValue({
+        reviewResult: {
+          verdict: "comment",
+          summary: " ",
+          resolvedCommentIds: [1],
+          newComments: [finding],
+        },
+        sessionId: "session-empty",
+      }),
+    };
+    await runReviewPr(deps);
+    expect(deps.resolveThreads).toHaveBeenCalledWith(expect.anything(), [
+      "thread-1",
+    ]);
+    expect(deps.submitReview).toHaveBeenCalledWith(
+      expect.anything(),
+      "maxi",
+      "example",
+      7,
+      "head-sha",
+      expect.stringContaining("review body was empty"),
+      [finding]
+    );
+    expect(JSON.parse(deps.uploadArtifact.mock.calls[0][1])).toMatchObject({
+      outcome: "EMPTY_REVIEW_BODY",
+      validatedReview: null,
+    });
+    expect(core.setFailed).toHaveBeenCalled();
+  });
+
+  it("does not overturn a successful review if the job summary cannot be written", async () => {
+    const deps = {
+      ...completedReviewDeps(),
+      writeJobSummary: vi
+        .fn()
+        .mockRejectedValue(new Error("summary unavailable")),
+    };
+    await runReviewPr(deps);
+    expect(core.warning).toHaveBeenCalledWith(
+      expect.stringContaining("summary unavailable")
+    );
+    expect(core.setFailed).not.toHaveBeenCalled();
+    expect(deps.setStatus.mock.calls.map((call) => call[5])).toContain(
+      "success"
+    );
   });
 
   it("keeps a normal review body as a passing check when fail_on is never", async () => {
