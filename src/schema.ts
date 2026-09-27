@@ -207,7 +207,12 @@ function validateReviewOutcomeMetadata(
   requireEnum(
     record,
     "outcome",
-    ["TIMED_OUT_NO_CONTENT", "REVIEWED_NO_FINDINGS", "REVIEWED_WITH_FINDINGS"],
+    [
+      "TIMED_OUT_NO_CONTENT",
+      "EMPTY_REVIEW_BODY",
+      "REVIEWED_NO_FINDINGS",
+      "REVIEWED_WITH_FINDINGS",
+    ],
     errors
   );
   if (

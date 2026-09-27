@@ -804,21 +804,35 @@ export async function runReviewPr(
         const threadIds = context.openThreads
           .filter((t) => resolvedCommentIds.includes(t.index))
           .map((t) => t.threadId);
-        if (threadIds.length) await deps.resolveThreads(octokit, threadIds);
+        if (threadIds.length) {
+          try {
+            await deps.resolveThreads(octokit, threadIds);
+          } catch (err) {
+            core.warning(
+              `Could not resolve empty-review threads: ${String(err)}`
+            );
+          }
+        }
       }
       const publishableComments = (newComments || []).filter(
         (c) => !matchesAnyGlob(c.file, ignoreGlobs)
       );
       if (publishableComments.length) {
-        await deps.submitReview(
-          octokit,
-          owner,
-          repo,
-          prNumber,
-          headSha,
-          `${COMMENT_MARKER}\n## Maxi Review\n\nThe review body was empty; the check failed, but these findings were returned.\n\n---\n_Session: \`${sessionId}\`_`,
-          publishableComments
-        );
+        try {
+          await deps.submitReview(
+            octokit,
+            owner,
+            repo,
+            prNumber,
+            headSha,
+            `${COMMENT_MARKER}\n## Maxi Review\n\nThe review body was empty; the check failed, but these findings were returned.\n\n---\n_Session: \`${sessionId}\`_`,
+            publishableComments
+          );
+        } catch (err) {
+          core.warning(
+            `Could not publish empty-review findings: ${String(err)}`
+          );
+        }
       }
       await deps.setStatus(
         octokit,

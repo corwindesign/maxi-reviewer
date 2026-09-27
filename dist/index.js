@@ -69685,7 +69685,12 @@ function validateReviewOutcomeMetadata(record, errors) {
         errors.push("review outcome metadata must be present as a complete set");
     }
     requireString(record, "outcomeSchema", "maxi.review.v1.review-outcome", errors);
-    requireEnum(record, "outcome", ["TIMED_OUT_NO_CONTENT", "REVIEWED_NO_FINDINGS", "REVIEWED_WITH_FINDINGS"], errors);
+    requireEnum(record, "outcome", [
+        "TIMED_OUT_NO_CONTENT",
+        "EMPTY_REVIEW_BODY",
+        "REVIEWED_NO_FINDINGS",
+        "REVIEWED_WITH_FINDINGS",
+    ], errors);
     if (!Number.isInteger(record.reviewOutputChars) ||
         record.reviewOutputChars < 0) {
         errors.push("reviewOutputChars must be a non-negative integer");
@@ -73524,12 +73529,23 @@ async function runReviewPr(overrides = {}) {
                 const threadIds = context.openThreads
                     .filter((t) => resolvedCommentIds.includes(t.index))
                     .map((t) => t.threadId);
-                if (threadIds.length)
-                    await deps.resolveThreads(octokit, threadIds);
+                if (threadIds.length) {
+                    try {
+                        await deps.resolveThreads(octokit, threadIds);
+                    }
+                    catch (err) {
+                        core/* warning */.$e(`Could not resolve empty-review threads: ${String(err)}`);
+                    }
+                }
             }
             const publishableComments = (newComments || []).filter((c) => !matchesAnyGlob(c.file, ignoreGlobs));
             if (publishableComments.length) {
-                await deps.submitReview(octokit, owner, repo, prNumber, headSha, `${COMMENT_MARKER}\n## Maxi Review\n\nThe review body was empty; the check failed, but these findings were returned.\n\n---\n_Session: \`${sessionId}\`_`, publishableComments);
+                try {
+                    await deps.submitReview(octokit, owner, repo, prNumber, headSha, `${COMMENT_MARKER}\n## Maxi Review\n\nThe review body was empty; the check failed, but these findings were returned.\n\n---\n_Session: \`${sessionId}\`_`, publishableComments);
+                }
+                catch (err) {
+                    core/* warning */.$e(`Could not publish empty-review findings: ${String(err)}`);
+                }
             }
             await deps.setStatus(octokit, owner, repo, headSha, statusContext, "failure", emptyReviewStatus(summary.length));
             try {

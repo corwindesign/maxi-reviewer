@@ -1025,6 +1025,47 @@ describe("empty review body is never a passing check", () => {
     expect(core.setFailed).toHaveBeenCalled();
   });
 
+  it("preserves the blank-review failure when finding delivery fails", async () => {
+    const deps = {
+      ...completedReviewDeps(),
+      writeJobSummary: vi.fn().mockResolvedValue(undefined),
+      runJulesReview: vi.fn().mockResolvedValue({
+        reviewResult: {
+          verdict: "comment",
+          summary: " ",
+          resolvedCommentIds: [],
+          newComments: [
+            {
+              file: "src/a.ts",
+              line: 1,
+              severity: "Warning",
+              confidence: "High",
+              message: "Fix",
+              promptForAgents: "Fix",
+            },
+          ],
+        },
+        sessionId: "session-empty",
+      }),
+      submitReview: vi.fn().mockRejectedValue(new Error("delivery failed")),
+    };
+    await runReviewPr(deps);
+    expect(core.warning).toHaveBeenCalledWith(
+      expect.stringContaining("delivery failed")
+    );
+    expect(deps.setStatus).toHaveBeenCalledWith(
+      expect.anything(),
+      "maxi",
+      "example",
+      "head-sha",
+      "",
+      "failure",
+      emptyReviewStatus(1)
+    );
+    expect(deps.writeJobSummary).toHaveBeenCalledWith(1);
+    expect(core.setFailed).toHaveBeenCalledWith(emptyReviewExplanation(1));
+  });
+
   it("does not overturn a successful review if the job summary cannot be written", async () => {
     const deps = {
       ...completedReviewDeps(),
