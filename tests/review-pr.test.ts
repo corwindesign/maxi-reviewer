@@ -931,64 +931,58 @@ describe("empty review body is never a passing check", () => {
   it.each([
     { name: "empty", summary: "" },
     { name: "whitespace-only", summary: "  \n\t  " },
-  ])(
-    "fails the job when the review body is $name",
-    async ({ summary }) => {
-      const writeJobSummary = vi.fn().mockResolvedValue(undefined);
-      const deps = {
-        ...completedReviewDeps(),
-        writeJobSummary,
-        runJulesReview: vi.fn().mockResolvedValue({
-          reviewResult: {
-            verdict: "approve",
-            summary,
-            resolvedCommentIds: [],
-            newComments: [],
-          },
-          sessionId: "session-empty",
-        }),
-      };
+  ])("fails the job when the review body is $name", async ({ summary }) => {
+    const writeJobSummary = vi.fn().mockResolvedValue(undefined);
+    const deps = {
+      ...completedReviewDeps(),
+      writeJobSummary,
+      runJulesReview: vi.fn().mockResolvedValue({
+        reviewResult: {
+          verdict: "approve",
+          summary,
+          resolvedCommentIds: [],
+          newComments: [],
+        },
+        sessionId: "session-empty",
+      }),
+    };
 
-      await runReviewPr(deps);
+    await runReviewPr(deps);
 
-      expect(deps.submitReview).not.toHaveBeenCalled();
-      expect(writeJobSummary).toHaveBeenCalledWith(summary.length);
-      expect(core.setFailed).toHaveBeenCalledWith(
-        emptyReviewExplanation(summary.length)
-      );
-      expect(deps.setStatus).toHaveBeenCalledWith(
-        expect.anything(),
-        "maxi",
-        "example",
-        "head-sha",
-        "",
-        "failure",
-        emptyReviewStatus(summary.length)
-      );
-      const states = deps.setStatus.mock.calls.map((call) => call[5]);
-      expect(states).not.toContain("success");
-    }
-  );
+    expect(deps.submitReview).not.toHaveBeenCalled();
+    expect(writeJobSummary).toHaveBeenCalledWith(summary.length);
+    expect(core.setFailed).toHaveBeenCalledWith(
+      emptyReviewExplanation(summary.length)
+    );
+    expect(deps.setStatus).toHaveBeenCalledWith(
+      expect.anything(),
+      "maxi",
+      "example",
+      "head-sha",
+      "",
+      "failure",
+      emptyReviewStatus(summary.length)
+    );
+    const states = deps.setStatus.mock.calls.map((call) => call[5]);
+    expect(states).not.toContain("success");
+  });
 
-  it(
-    "keeps a normal review body as a passing check when fail_on is never",
-    async () => {
-      const writeJobSummary = vi.fn().mockResolvedValue(undefined);
-      const deps = {
-        ...completedReviewDeps(),
-        writeJobSummary,
-      };
+  it("keeps a normal review body as a passing check when fail_on is never", async () => {
+    const writeJobSummary = vi.fn().mockResolvedValue(undefined);
+    const deps = {
+      ...completedReviewDeps(),
+      writeJobSummary,
+    };
 
-      await runReviewPr(deps);
+    await runReviewPr(deps);
 
-      expect(deps.submitReview).toHaveBeenCalled();
-      expect(core.setFailed).not.toHaveBeenCalled();
-      expect(writeJobSummary).toHaveBeenCalledWith("Looks okay.".length);
-      const states = deps.setStatus.mock.calls.map((call) => call[5]);
-      expect(states).toContain("success");
-      expect(states).not.toContain("failure");
-    }
-  );
+    expect(deps.submitReview).toHaveBeenCalled();
+    expect(core.setFailed).not.toHaveBeenCalled();
+    expect(writeJobSummary).toHaveBeenCalledWith("Looks okay.".length);
+    const states = deps.setStatus.mock.calls.map((call) => call[5]);
+    expect(states).toContain("success");
+    expect(states).not.toContain("failure");
+  });
 });
 
 describe("isBlankReviewBody", () => {

@@ -73004,6 +73004,24 @@ function reviewTimeoutExplanation(timeoutMinutes) {
         "Either way, re-running this job often succeeds.",
     ].join(" ");
 }
+/** True when a review body is missing any non-whitespace content. */
+function isBlankReviewBody(body) {
+    return body.trim().length === 0;
+}
+/**
+ * Status line for a parsed review whose body is empty or whitespace-only.
+ * Distinct from a timeout: something came back, but it was not a review.
+ */
+function emptyReviewStatus(collectedCharacters) {
+    return truncate(`Empty review body (${collectedCharacters} chars) — no review was produced.`, STATUS_DESCRIPTION_MAX);
+}
+/** Long-form of {@link emptyReviewStatus} for the log and the job failure. */
+function emptyReviewExplanation(collectedCharacters) {
+    return [
+        `Collected an empty or whitespace-only review body (${collectedCharacters} chars), so no review was produced.`,
+        "This is not a verdict on the code.",
+    ].join(" ");
+}
 /**
  * Pick the reviewer and, when Jules is primary, fall through if it never replies.
  *
@@ -73398,6 +73416,15 @@ async function runReviewPr(overrides = {}) {
             return;
         }
         const { verdict, summary, resolvedCommentIds, newComments } = reviewResult;
+        // A parsed result with no body is the quiet sibling of a timeout: the
+        // job used to return normally, so the Actions check stayed SUCCESS even
+        // though nothing was reviewed. fail_on=never must not paint that green.
+        if (isBlankReviewBody(summary)) {
+            await deps.setStatus(octokit, owner, repo, headSha, statusContext, "failure", emptyReviewStatus(summary.length));
+            await deps.writeJobSummary(summary.length);
+            core/* setFailed */.C1(emptyReviewExplanation(summary.length));
+            return;
+        }
         // Resolve threads that the LLM identified as fixed
         if (resolvedCommentIds && resolvedCommentIds.length > 0) {
             const threadIdsToResolve = context.openThreads
@@ -73415,6 +73442,7 @@ async function runReviewPr(overrides = {}) {
         (newComments || []).filter((c) => !matchesAnyGlob(c.file, ignoreGlobs)));
         const { state, description } = statusFromVerdict(verdict, failOn);
         await deps.setStatus(octokit, owner, repo, headSha, statusContext, state, description);
+        await deps.writeJobSummary(summary.length);
         core/* info */.pq(`Verdict: ${verdict}. Status check: ${state}.`);
     }
     catch (err) {
