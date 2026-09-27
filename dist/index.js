@@ -69685,7 +69685,12 @@ function validateReviewOutcomeMetadata(record, errors) {
         errors.push("review outcome metadata must be present as a complete set");
     }
     requireString(record, "outcomeSchema", "maxi.review.v1.review-outcome", errors);
-    requireEnum(record, "outcome", ["TIMED_OUT_NO_CONTENT", "REVIEWED_NO_FINDINGS", "REVIEWED_WITH_FINDINGS"], errors);
+    requireEnum(record, "outcome", [
+        "TIMED_OUT_NO_CONTENT",
+        "EMPTY_REVIEW_BODY",
+        "REVIEWED_NO_FINDINGS",
+        "REVIEWED_WITH_FINDINGS",
+    ], errors);
     if (!Number.isInteger(record.reviewOutputChars) ||
         record.reviewOutputChars < 0) {
         errors.push("reviewOutputChars must be a non-negative integer");
@@ -69696,9 +69701,10 @@ function validateReviewOutcomeMetadata(record, errors) {
         requirePositiveInt(identity, "workflowRunAttempt", errors, "runIdentity.");
         requireString(identity, "job", undefined, errors, "runIdentity.");
     }
-    if (record.outcome === "TIMED_OUT_NO_CONTENT" &&
+    if ((record.outcome === "TIMED_OUT_NO_CONTENT" ||
+        record.outcome === "EMPTY_REVIEW_BODY") &&
         record.validatedReview !== null) {
-        errors.push("TIMED_OUT_NO_CONTENT requires validatedReview to be null");
+        errors.push(`${String(record.outcome)} requires validatedReview to be null`);
     }
     if ((record.outcome === "REVIEWED_NO_FINDINGS" ||
         record.outcome === "REVIEWED_WITH_FINDINGS") &&
@@ -73097,6 +73103,24 @@ function reviewTimeoutExplanation(timeoutMinutes) {
         "Either way, re-running this job often succeeds.",
     ].join(" ");
 }
+/** True when a review body is missing any non-whitespace content. */
+function isBlankReviewBody(body) {
+    return body.trim().length === 0;
+}
+/**
+ * Status line for a parsed review whose body is empty or whitespace-only.
+ * Distinct from a timeout: something came back, but it was not a review.
+ */
+function emptyReviewStatus(collectedCharacters) {
+    return truncate(`Empty review body (${collectedCharacters} chars) — no review was produced.`, STATUS_DESCRIPTION_MAX);
+}
+/** Long-form of {@link emptyReviewStatus} for the log and the job failure. */
+function emptyReviewExplanation(collectedCharacters) {
+    return [
+        `Collected an empty or whitespace-only review body (${collectedCharacters} chars), so no review was produced.`,
+        "This is not a verdict on the code.",
+    ].join(" ");
+}
 /**
  * Pick the reviewer and, when Jules is primary, fall through if it never replies.
  *
@@ -73410,11 +73434,14 @@ async function runReviewPr(overrides = {}) {
             julesOptions,
         });
         const { reviewResult, sessionId, rawResponses, validationErrors } = reviewRun;
+        const blankReview = reviewResult != null && isBlankReviewBody(reviewResult.summary);
         const outcome = !reviewResult
             ? "TIMED_OUT_NO_CONTENT"
-            : (reviewResult.newComments?.length ?? 0) > 0
-                ? "REVIEWED_WITH_FINDINGS"
-                : "REVIEWED_NO_FINDINGS";
+            : blankReview
+                ? "EMPTY_REVIEW_BODY"
+                : (reviewResult.newComments?.length ?? 0) > 0
+                    ? "REVIEWED_WITH_FINDINGS"
+                    : "REVIEWED_NO_FINDINGS";
         const reviewOutputChars = (rawResponses ?? []).reduce((total, response) => total + response.length, 0);
         const runIdentity = {
             workflowRunId: ctx.runId,
@@ -73438,12 +73465,14 @@ async function runReviewPr(overrides = {}) {
             timeoutMinutes,
             outcomeReason: outcome === "TIMED_OUT_NO_CONTENT"
                 ? reviewTimeoutExplanation(timeoutMinutes)
-                : undefined,
+                : blankReview
+                    ? emptyReviewExplanation(reviewResult.summary.length)
+                    : undefined,
             reviewOutputChars,
             runIdentity,
             analyzerFindings,
             rawJulesResponses: rawResponses || [],
-            validatedReview: reviewResult,
+            validatedReview: blankReview ? null : reviewResult,
             validationErrors: validationErrors || [],
             sessionId,
         });
@@ -73491,6 +73520,44 @@ async function runReviewPr(overrides = {}) {
             return;
         }
         const { verdict, summary, resolvedCommentIds, newComments } = reviewResult;
+        // A parsed result with no body is the quiet sibling of a timeout: the
+        // job used to return normally, so the Actions check stayed SUCCESS even
+        // though nothing was reviewed. fail_on=never must not paint that green.
+        if (isBlankReviewBody(summary)) {
+            // A missing narrative must fail the check, but do not hide independently
+            // actionable findings or thread resolutions returned by the reviewer.
+            if (resolvedCommentIds?.length) {
+                const threadIds = context.openThreads
+                    .filter((t) => resolvedCommentIds.includes(t.index))
+                    .map((t) => t.threadId);
+                if (threadIds.length) {
+                    try {
+                        await deps.resolveThreads(octokit, threadIds);
+                    }
+                    catch (err) {
+                        core/* warning */.$e(`Could not resolve empty-review threads: ${String(err)}`);
+                    }
+                }
+            }
+            const publishableComments = (newComments || []).filter((c) => !matchesAnyGlob(c.file, ignoreGlobs));
+            if (publishableComments.length) {
+                try {
+                    await deps.submitReview(octokit, owner, repo, prNumber, headSha, `${COMMENT_MARKER}\n## Maxi Review\n\nThe review body was empty; the check failed, but these findings were returned.\n\n---\n_Session: \`${sessionId}\`_`, publishableComments);
+                }
+                catch (err) {
+                    core/* warning */.$e(`Could not publish empty-review findings: ${String(err)}`);
+                }
+            }
+            await deps.setStatus(octokit, owner, repo, headSha, statusContext, "failure", emptyReviewStatus(summary.length));
+            try {
+                await deps.writeJobSummary(summary.length);
+            }
+            catch (err) {
+                core/* warning */.$e(`Could not write job summary: ${String(err)}`);
+            }
+            core/* setFailed */.C1(emptyReviewExplanation(summary.length));
+            return;
+        }
         // Resolve threads that the LLM identified as fixed
         if (resolvedCommentIds && resolvedCommentIds.length > 0) {
             const threadIdsToResolve = context.openThreads
@@ -73508,6 +73575,12 @@ async function runReviewPr(overrides = {}) {
         (newComments || []).filter((c) => !matchesAnyGlob(c.file, ignoreGlobs)));
         const { state, description } = statusFromVerdict(verdict, failOn);
         await deps.setStatus(octokit, owner, repo, headSha, statusContext, state, description);
+        try {
+            await deps.writeJobSummary(summary.length);
+        }
+        catch (err) {
+            core/* warning */.$e(`Could not write job summary: ${String(err)}`);
+        }
         core/* info */.pq(`Verdict: ${verdict}. Status check: ${state}.`);
     }
     catch (err) {
@@ -73673,6 +73746,8 @@ function latestReviewArtifactSessionId(comments) {
     for (const body of [...comments].reverse()) {
         const artifact = extractReviewArtifactFromComment(body);
         if (!artifact?.sessionId)
+            continue;
+        if (artifact.outcome === "EMPTY_REVIEW_BODY")
             continue;
         // Never resume a session that produced no review. A hung/stuck Jules session
         // (no responses, no validated review) would otherwise be resumed on every
