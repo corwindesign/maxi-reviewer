@@ -1,7 +1,10 @@
 export type FailOn = "never" | "blocking" | "any";
 export type Verdict = "approve" | "comment" | "block";
 export type ReviewOutcome =
-  "TIMED_OUT_NO_CONTENT" | "REVIEWED_NO_FINDINGS" | "REVIEWED_WITH_FINDINGS";
+  | "TIMED_OUT_NO_CONTENT"
+  | "EMPTY_REVIEW_BODY"
+  | "REVIEWED_NO_FINDINGS"
+  | "REVIEWED_WITH_FINDINGS";
 
 export interface ReviewRunIdentity {
   workflowRunId: number;
