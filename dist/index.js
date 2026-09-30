@@ -71832,8 +71832,9 @@ ${items}
 `;
     }
     // ── 1. The contract comes FIRST and is non-negotiable ────────────────────
-    const header = `You are a JSON-generating code-review engine. You are NOT a chat assistant.
+    const header = `# Review: PR #${prNumber} — ${prTitle || "Untitled"}
 
+You are a JSON-generating code-review engine. You are NOT a chat assistant.
 You can only speak in one language: a single, perfectly-formed JSON object that
 conforms to the schema below. You never emit anything else — no greeting, no
 prose, no explanation, no apology, no markdown prose, no text before or after
@@ -72740,6 +72741,7 @@ function filterDiffByPaths(diff, ignoreGlobs) {
 
 
 const ORDER = [
+    "php",
     "javascript",
     "typescript",
     "python",
@@ -72755,7 +72757,9 @@ function selectRuleFiles(paths) {
         if (/^\.github\/workflows\/.+\.ya?ml$/.test(path)) {
             langs.add("github-actions");
         }
-        if (/\.(js|jsx|mjs|cjs)$/.test(path))
+        if (/\.(php|phtml)$/.test(path))
+            langs.add("php");
+        if (/\.(js|jsx|mjs|cjs|vue)$/.test(path))
             langs.add("javascript");
         if (/\.(ts|tsx)$/.test(path))
             langs.add("typescript");

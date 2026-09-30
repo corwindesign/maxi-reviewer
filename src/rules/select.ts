@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
 const ORDER = [
+  "php",
   "javascript",
   "typescript",
   "python",
@@ -18,7 +19,8 @@ export function selectRuleFiles(paths: string[]): string[] {
     if (/^\.github\/workflows\/.+\.ya?ml$/.test(path)) {
       langs.add("github-actions");
     }
-    if (/\.(js|jsx|mjs|cjs)$/.test(path)) langs.add("javascript");
+    if (/\.(php|phtml)$/.test(path)) langs.add("php");
+    if (/\.(js|jsx|mjs|cjs|vue)$/.test(path)) langs.add("javascript");
     if (/\.(ts|tsx)$/.test(path)) langs.add("typescript");
     if (/\.py$/.test(path)) langs.add("python");
     if (/\.rs$/.test(path)) langs.add("rust");
