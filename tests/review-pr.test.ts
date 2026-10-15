@@ -299,6 +299,66 @@ describe("runReviewPr orchestration", () => {
     expect(commentArtifact.rawJulesResponses).toEqual([]);
   });
 
+  it("keeps baseShaForDiff = baseSha during synchronize events when incremental_reviews is false", async () => {
+    (
+      github as typeof github & { context: typeof github.context }
+    ).context.payload = {
+      action: "synchronize",
+      before: "before-sha",
+      pull_request: {
+        number: 7,
+        base: { sha: "base-sha", ref: "main" },
+        head: { sha: "head-sha", ref: "feature" },
+      },
+    };
+    vi.spyOn(core, "getBooleanInput").mockReturnValue(false);
+    const deps = completedReviewDeps();
+    await runReviewPr(deps);
+    expect(deps.fetchPullRequestContext).toHaveBeenCalledWith(
+      expect.objectContaining({
+        baseSha: "base-sha",
+        baseShaForDiff: "base-sha",
+        headSha: "head-sha",
+      })
+    );
+    expect(deps.buildReviewPrompt).toHaveBeenCalledWith(
+      expect.objectContaining({
+        incrementalReview: false,
+      })
+    );
+  });
+
+  it("sets baseShaForDiff = ctx.payload.before during synchronize events when incremental_reviews is true", async () => {
+    (
+      github as typeof github & { context: typeof github.context }
+    ).context.payload = {
+      action: "synchronize",
+      before: "before-sha",
+      pull_request: {
+        number: 7,
+        base: { sha: "base-sha", ref: "main" },
+        head: { sha: "head-sha", ref: "feature" },
+      },
+    };
+    vi.spyOn(core, "getBooleanInput").mockImplementation(
+      (name: string) => name === "incremental_reviews"
+    );
+    const deps = completedReviewDeps();
+    await runReviewPr(deps);
+    expect(deps.fetchPullRequestContext).toHaveBeenCalledWith(
+      expect.objectContaining({
+        baseSha: "base-sha",
+        baseShaForDiff: "before-sha",
+        headSha: "head-sha",
+      })
+    );
+    expect(deps.buildReviewPrompt).toHaveBeenCalledWith(
+      expect.objectContaining({
+        incrementalReview: true,
+      })
+    );
+  });
+
   it("distinguishes reused sessions by immutable run identity", async () => {
     const deps = {
       fetchPullRequestContext: vi.fn().mockResolvedValue({

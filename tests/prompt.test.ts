@@ -360,6 +360,62 @@ describe("buildReviewPrompt", () => {
 
     expect(prompt).not.toContain("incremental review of only the latest push");
   });
+
+  it("instructs model not to assume comments are unresolved due to incremental diff window when incrementalReview is true", () => {
+    const prompt = buildReviewPrompt({
+      repoFullName: "owner/repo",
+      prNumber: 1,
+      prTitle: "t",
+      prBody: "b",
+      diff: "+ x",
+      incrementalReview: true,
+      openThreads: [
+        {
+          index: 1,
+          threadId: "t1",
+          path: "file.ts",
+          line: 10,
+          body: "Bad code",
+          comments: [],
+        },
+      ],
+    });
+
+    expect(prompt).toContain(
+      "Never assume a comment is unresolved simply because its line falls outside the incremental diff window"
+    );
+    expect(prompt).not.toContain(
+      "Ensure resolvedCommentIds checks against the full PR diff context"
+    );
+  });
+
+  it("instructs model to check resolvedCommentIds against full PR diff context when incrementalReview is false or omitted", () => {
+    const prompt = buildReviewPrompt({
+      repoFullName: "owner/repo",
+      prNumber: 1,
+      prTitle: "t",
+      prBody: "b",
+      diff: "+ x",
+      incrementalReview: false,
+      openThreads: [
+        {
+          index: 1,
+          threadId: "t1",
+          path: "file.ts",
+          line: 10,
+          body: "Bad code",
+          comments: [],
+        },
+      ],
+    });
+
+    expect(prompt).toContain(
+      "Ensure resolvedCommentIds checks against the full PR diff context"
+    );
+    expect(prompt).not.toContain(
+      "Never assume a comment is unresolved simply because its line falls outside the incremental diff window"
+    );
+  });
 });
 
 describe("buildReviewPrompt CI signal", () => {

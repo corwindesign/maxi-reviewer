@@ -500,18 +500,39 @@ export async function runReviewPr(
     }
 
     // Determine the base SHA for incremental diffing
+    let incrementalReviews = false;
+    try {
+      incrementalReviews = core.getBooleanInput("incremental_reviews", {
+        required: false,
+      });
+    } catch {
+      incrementalReviews = false;
+    }
+    if (!incrementalReviews) {
+      const raw = core.getInput("incremental_reviews");
+      if (raw && (raw.toLowerCase() === "true" || raw === "1")) {
+        incrementalReviews = true;
+      }
+    }
+
     let baseShaForDiff = baseSha;
-    if (ctx.payload.action === "synchronize" && ctx.payload.before) {
+    if (
+      incrementalReviews &&
+      ctx.payload.action === "synchronize" &&
+      ctx.payload.before
+    ) {
       baseShaForDiff = ctx.payload.before;
       core.info(
-        `Synchronize event detected. Reviewing incremental changes from ${baseShaForDiff} to ${headSha}`
+        `Incremental review enabled: reviewing changes from ${baseShaForDiff} to ${headSha}`
       );
     } else {
       core.info(`Reviewing full PR diff from ${baseShaForDiff} to ${headSha}`);
     }
 
     const isIncrementalReview =
-      ctx.payload.action === "synchronize" && !!ctx.payload.before;
+      incrementalReviews &&
+      ctx.payload.action === "synchronize" &&
+      !!ctx.payload.before;
     // GitHub only honours PR-body closing keywords when the PR targets the
     // repository default branch; for backport/release PRs to other branches the
     // referenced issues are not actually linked, so skip acceptance-criteria
