@@ -303,12 +303,31 @@ describe("index.ts", () => {
     );
   });
 
-  it("uses ctx.payload.before for diff on synchronize event", async () => {
+  it("uses baseSha for diff on synchronize event by default", async () => {
     (github as any).context.payload.action = "synchronize";
     (github as any).context.payload.before = "beforeSHA";
     await loadIndex();
-    // Same reason as the truncation test: `fetchDiff` is not one of loadIndex's
-    // settle conditions, so assert on it through a bounded wait.
+    await vi.waitFor(
+      () =>
+        expect(mockGithubHelper.fetchDiff).toHaveBeenCalledWith(
+          expect.anything(),
+          "owner",
+          "repo",
+          expect.anything(),
+          "baseSHA",
+          "headSHA"
+        ),
+      SETTLE_OPTIONS
+    );
+  });
+
+  it("uses ctx.payload.before for diff on synchronize event when incremental_reviews is true", async () => {
+    mockGetBooleanInput.mockImplementation(
+      (name: string) => name === "incremental_reviews"
+    );
+    (github as any).context.payload.action = "synchronize";
+    (github as any).context.payload.before = "beforeSHA";
+    await loadIndex();
     await vi.waitFor(
       () =>
         expect(mockGithubHelper.fetchDiff).toHaveBeenCalledWith(
