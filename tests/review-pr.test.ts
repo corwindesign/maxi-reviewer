@@ -10,6 +10,7 @@ import {
   emptyReviewExplanation,
   emptyReviewStatus,
   fetchPullRequestContext,
+  findingMatchesThread,
   isBlankReviewBody,
   latestReviewArtifactSessionId,
   reviewTimeoutExplanation,
@@ -563,7 +564,10 @@ describe("runReviewPr orchestration", () => {
     expect(deps.submitReview).not.toHaveBeenCalled();
   });
 
-  it("passes the latest recorded Jules session id into the review request", async () => {
+  it("passes the latest recorded Jules session id into the review request when reuse_review_session is true", async () => {
+    vi.spyOn(core, "getBooleanInput").mockImplementation(
+      (name: string) => name === "reuse_review_session"
+    );
     const deps = {
       fetchPullRequestContext: vi.fn().mockResolvedValue({
         diff: "diff --git a/src/a.ts b/src/a.ts\n@@ -1 +1 @@\n-old\n+new\n",
@@ -623,6 +627,89 @@ describe("runReviewPr orchestration", () => {
         previousSessionId: "prev-session",
         onProgress: expect.any(Function),
       }
+    );
+  });
+
+  it("omits previousSessionId by default when reuse_review_session is false", async () => {
+    const deps = completedReviewDeps();
+    deps.listReviewArtifactComments = vi.fn().mockResolvedValue([
+      artifactComment({
+        headSha: "previous-head",
+        sessionId: "prev-session",
+      }),
+    ]);
+    await runReviewPr(deps);
+    expect(deps.runJulesReview).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      expect.anything(),
+      expect.anything(),
+      expect.not.objectContaining({
+        previousSessionId: "prev-session",
+      })
+    );
+  });
+
+  it("filters out new comments that duplicate an unresolved open thread on the same file and line", async () => {
+    const deps = completedReviewDeps();
+    deps.fetchPullRequestContext = vi.fn().mockResolvedValue({
+      diff: "diff --git a/src/a.ts b/src/a.ts\n@@ -1 +1 @@\n-old\n+new\n",
+      changedFiles: ["src/a.ts"],
+      files: new Map([["src/a.ts", "new\n"]]),
+      changedLines: new Map([["src/a.ts", new Set([1])]]),
+      rulesFromFile: undefined,
+      openThreads: [
+        {
+          index: 1,
+          threadId: "thread-1",
+          path: "src/a.ts",
+          line: 1,
+          body: "Fix line 1",
+          comments: [],
+        },
+      ],
+      linkedIssues: [],
+    });
+    deps.runJulesReview = vi.fn().mockResolvedValue({
+      reviewResult: {
+        verdict: "comment",
+        summary: "Needs work.",
+        resolvedCommentIds: [],
+        newComments: [
+          {
+            file: "src/a.ts",
+            line: 1,
+            severity: "Warning",
+            confidence: "High",
+            message: "Fix line 1 again",
+            promptForAgents: "fix",
+          },
+          {
+            file: "src/a.ts",
+            line: 2,
+            severity: "Warning",
+            confidence: "High",
+            message: "New issue on line 2",
+            promptForAgents: "fix",
+          },
+        ],
+      },
+      sessionId: "sess-1",
+    });
+    await runReviewPr(deps);
+    expect(deps.submitReview).toHaveBeenCalledWith(
+      expect.anything(),
+      "maxi",
+      "example",
+      7,
+      "head-sha",
+      expect.anything(),
+      [
+        expect.objectContaining({
+          file: "src/a.ts",
+          line: 2,
+        }),
+      ]
     );
   });
 
@@ -1432,5 +1519,267 @@ describe("runAnalyzers", () => {
     expect(warning).not.toHaveBeenCalledWith(
       expect.stringContaining("Analyzer command failed")
     );
+  });
+});
+
+describe("findingMatchesThread", () => {
+  const thread = {
+    index: 1,
+    threadId: "thread-1",
+    path: "src/service.ts",
+    line: 10,
+    body: "<!-- maxi-review-inline-comment -->\n**Severity:** ⚠️ Warning\n\nPotential SQL injection in query concatenation.",
+    comments: [],
+  };
+
+  it("matches when file, line, and message correspond to the thread issue", () => {
+    const finding = {
+      file: "src/service.ts",
+      line: 10,
+      severity: "Warning" as const,
+      confidence: "High" as const,
+      message: "SQL injection vulnerability: sanitize query concatenation",
+      promptForAgents: "fix",
+    };
+    expect(findingMatchesThread(finding, thread)).toBe(true);
+  });
+
+  it("does not match when file and line match but message is a distinct finding", () => {
+    const finding = {
+      file: "src/service.ts",
+      line: 10,
+      severity: "Warning" as const,
+      confidence: "High" as const,
+      message: "Unused parameter `req`; consider prefixing with underscore",
+      promptForAgents: "fix",
+    };
+    expect(findingMatchesThread(finding, thread)).toBe(false);
+  });
+
+  it("does not match when file differs", () => {
+    const finding = {
+      file: "src/other.ts",
+      line: 10,
+      severity: "Warning" as const,
+      confidence: "High" as const,
+      message: "Potential SQL injection in query concatenation",
+      promptForAgents: "fix",
+    };
+    expect(findingMatchesThread(finding, thread)).toBe(false);
+  });
+
+  it("matches multi-line finding if thread line falls within range", () => {
+    const finding = {
+      file: "src/service.ts",
+      line: 12,
+      startLine: 8,
+      endLine: 12,
+      severity: "Warning" as const,
+      confidence: "High" as const,
+      message: "Potential SQL injection in query concatenation",
+      promptForAgents: "fix",
+    };
+    expect(findingMatchesThread(finding, thread)).toBe(true);
+  });
+});
+
+describe("open thread deduplication and context in runReviewPr", () => {
+  it("preserves distinct findings on the same line in submitReview and empty-review paths", async () => {
+    const baseContext = {
+      diff: "diff --git a/src/a.ts b/src/a.ts\n@@ -10 +10 @@\n-old\n+new\n",
+      changedFiles: ["src/a.ts"],
+      files: new Map([
+        [
+          "src/a.ts",
+          Array.from({ length: 30 }, (_, i) => `line ${i + 1}`).join("\n"),
+        ],
+      ]),
+      changedLines: new Map([["src/a.ts", new Set([10])]]),
+      rulesFromFile: undefined,
+      openThreads: [
+        {
+          index: 1,
+          threadId: "t-sql",
+          path: "src/a.ts",
+          line: 10,
+          body: "<!-- maxi-review-inline-comment -->\n**Severity:** 🚨 High\n\nSQL injection vulnerability.",
+          comments: [],
+        },
+      ],
+      linkedIssues: [],
+    };
+
+    const duplicateFinding = {
+      file: "src/a.ts",
+      line: 10,
+      severity: "High" as const,
+      confidence: "High" as const,
+      message: "SQL injection vulnerability in query",
+      promptForAgents: "fix",
+    };
+    const distinctFinding = {
+      file: "src/a.ts",
+      line: 10,
+      severity: "Warning" as const,
+      confidence: "High" as const,
+      message: "Unused local variable `count`",
+      promptForAgents: "fix",
+    };
+
+    // 1. Normal submitReview path: duplicate suppressed, distinct published
+    const depsNormal: any = completedReviewDeps();
+    depsNormal.fetchPullRequestContext = vi.fn().mockResolvedValue(baseContext);
+    depsNormal.fetchExistingFindings = vi.fn().mockResolvedValue([]);
+    depsNormal.runJulesReview = vi.fn().mockResolvedValue({
+      reviewResult: {
+        verdict: "comment",
+        summary: "Reviewed.",
+        resolvedCommentIds: [],
+        newComments: [duplicateFinding, distinctFinding],
+      },
+      sessionId: "sess-1",
+    });
+    await runReviewPr(depsNormal);
+    expect(depsNormal.submitReview).toHaveBeenCalledWith(
+      expect.anything(),
+      "maxi",
+      "example",
+      7,
+      "head-sha",
+      expect.anything(),
+      [expect.objectContaining({ message: "Unused local variable `count`" })]
+    );
+
+    // 2. Empty-review fallback path: duplicate suppressed, distinct published
+    const depsEmpty: any = completedReviewDeps();
+    depsEmpty.fetchPullRequestContext = vi.fn().mockResolvedValue(baseContext);
+    depsEmpty.fetchExistingFindings = vi.fn().mockResolvedValue([]);
+    depsEmpty.runJulesReview = vi.fn().mockResolvedValue({
+      reviewResult: {
+        verdict: "comment",
+        summary: "", // empty body triggers fallback
+        resolvedCommentIds: [],
+        newComments: [duplicateFinding, distinctFinding],
+      },
+      sessionId: "sess-empty",
+    });
+    await runReviewPr(depsEmpty);
+    expect(depsEmpty.submitReview).toHaveBeenCalledWith(
+      expect.anything(),
+      "maxi",
+      "example",
+      7,
+      "head-sha",
+      expect.stringContaining("The review body was empty"),
+      [expect.objectContaining({ message: "Unused local variable `count`" })]
+    );
+  });
+
+  it("includes current source surrounding open-thread locations outside visible diff in buildReviewPrompt", async () => {
+    let capturedPromptArgs: any;
+    const deps: any = completedReviewDeps();
+    deps.fetchPullRequestContext = vi.fn().mockResolvedValue({
+      diff: "diff --git a/src/in-diff.ts b/src/in-diff.ts\n@@ -5 +5 @@\n-old\n+new\n",
+      changedFiles: ["src/in-diff.ts"],
+      files: new Map([
+        ["src/in-diff.ts", "line 1\nline 2\nline 3\nline 4\nline 5\n"],
+        [
+          "src/outside-diff.ts",
+          Array.from({ length: 40 }, (_, i) => `outside line ${i + 1}`).join(
+            "\n"
+          ),
+        ],
+      ]),
+      changedLines: new Map([["src/in-diff.ts", new Set([5])]]),
+      rulesFromFile: undefined,
+      openThreads: [
+        {
+          index: 1,
+          threadId: "t-outside",
+          path: "src/outside-diff.ts",
+          line: 20,
+          body: "<!-- maxi-review-inline-comment -->\nFix line 20",
+          comments: [],
+        },
+      ],
+      linkedIssues: [],
+    });
+    deps.fetchExistingFindings = vi.fn().mockResolvedValue([]);
+    deps.buildReviewPrompt = vi.fn((args) => {
+      capturedPromptArgs = args;
+      return "prompt";
+    });
+
+    await runReviewPr(deps);
+    expect(capturedPromptArgs).toBeDefined();
+    const contextFiles = capturedPromptArgs.changedFileContext.map(
+      (f: any) => f.path
+    );
+    expect(contextFiles).toContain("src/outside-diff.ts");
+    const outsideContext = capturedPromptArgs.changedFileContext.find(
+      (f: any) => f.path === "src/outside-diff.ts"
+    );
+    expect(outsideContext.windows[0].text).toContain("outside line 20");
+  });
+});
+
+describe("fetchPullRequestContext with open threads outside diff", () => {
+  it("loads head files for open-thread paths not in changed diff", async () => {
+    const diff = "diff --git a/src/a.ts b/src/a.ts\n@@ -1 +1 @@\n-old\n+new\n";
+    const octokit = {
+      rest: {
+        repos: {
+          compareCommitsWithBasehead: vi.fn().mockResolvedValue({ data: diff }),
+          getContent: vi.fn(async ({ path }: { path: string }) => ({
+            data: {
+              content: Buffer.from(
+                path === "src/a.ts" ? "new a\n" : "new outside\n"
+              ).toString("base64"),
+            },
+          })),
+        },
+      },
+      graphql: vi.fn().mockResolvedValue({
+        repository: {
+          pullRequest: {
+            reviewThreads: {
+              nodes: [
+                {
+                  id: "t-outside",
+                  isResolved: false,
+                  comments: {
+                    nodes: [
+                      {
+                        path: "src/outside.ts",
+                        line: 5,
+                        body: "<!-- maxi-review-inline-comment -->\nfix outside",
+                        author: { login: "bot" },
+                        viewerDidAuthor: true,
+                        createdAt: "2026-01-01",
+                      },
+                    ],
+                  },
+                },
+              ],
+            },
+          },
+        },
+      }),
+    } as any;
+
+    const context = await fetchPullRequestContext({
+      octokit,
+      owner: "maxi",
+      repo: "example",
+      pr: { number: 7 },
+      baseSha: "base",
+      baseShaForDiff: "base",
+      headSha: "head",
+      rulesFilePath: "",
+      groundInLinkedIssues: false,
+    });
+
+    expect(context.files.has("src/outside.ts")).toBe(true);
+    expect(context.files.get("src/outside.ts")).toBe("new outside\n");
   });
 });

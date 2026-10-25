@@ -174,6 +174,7 @@ Project-specific rules can still be supplied with `extra_instructions` or `rules
 | `coverage_summary` | | Path to a coverage summary file (e.g. a coverage delta) to ingest as CI evidence. |
 | `dedupe_reviewers` | `off` | `auto` fetches other reviewers active inline comments and tells the model not to restate them. |
 | `incremental_reviews` | `false` | Whether to restrict reviews on `synchronize` events to incremental diffs (`before...headSha`). Default `false` reviews the full PR diff (`baseSha...headSha`). |
+| `reuse_review_session` | `false` | Whether to continue the prior Jules session on subsequent reviews of the same PR. Default `false` evaluates new commits with a fresh session to avoid stale context. |
 | `command`            |                                 | `/maxi ...` command for `workflow_dispatch`.                  |
 | `pr_number`          |                                 | Pull request number for `workflow_dispatch` commands.         |
 
