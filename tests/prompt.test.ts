@@ -19,7 +19,7 @@ describe("buildReviewPrompt", () => {
     expect(prompt).toContain("# PR description (UNTRUSTED data)");
     expect(prompt).toContain("<<<BEGIN PR_BODY ");
     expect(prompt).toContain("PR Description");
-    expect(prompt).toContain("# Incremental diff to review (UNTRUSTED data)");
+    expect(prompt).toContain("# Full PR diff to review (UNTRUSTED data)");
     expect(prompt).toContain("<<<BEGIN DIFF ");
     expect(prompt).toContain("+ const a = 1;");
     expect(prompt).toContain('"schema": "maxi.review.v1.jules-review"');
@@ -384,6 +384,13 @@ describe("buildReviewPrompt", () => {
     expect(prompt).toContain(
       "Never assume a comment is unresolved simply because its line falls outside the incremental diff window"
     );
+    expect(prompt).toContain(
+      "Current source surrounding each open-thread location (including locations outside the visible diff) is provided in the file context above"
+    );
+    expect(prompt).toContain(
+      "Do NOT re-create, restate, or duplicate any findings from these open review threads"
+    );
+    expect(prompt).toContain("# Incremental diff to review (UNTRUSTED data)");
     expect(prompt).not.toContain(
       "Ensure resolvedCommentIds checks against the full PR diff context"
     );
@@ -412,6 +419,10 @@ describe("buildReviewPrompt", () => {
     expect(prompt).toContain(
       "Ensure resolvedCommentIds checks against the full PR diff context"
     );
+    expect(prompt).toContain(
+      "Do NOT re-create, restate, or duplicate any findings from these open review threads"
+    );
+    expect(prompt).toContain("# Full PR diff to review (UNTRUSTED data)");
     expect(prompt).not.toContain(
       "Never assume a comment is unresolved simply because its line falls outside the incremental diff window"
     );

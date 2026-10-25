@@ -120,6 +120,10 @@ inputs:
     description: "Whether to restrict reviews on synchronize events to incremental diffs (ctx.payload.before...headSha). Defaults to false (reviews full PR diff baseSha...headSha)."
     required: false
     default: "false"
+  reuse_review_session:
+    description: "Whether to continue the prior Jules session on subsequent reviews of the same PR. Defaults to false so follow-up reviews on new commits evaluate updated code with a fresh session instead of retaining stale session context."
+    required: false
+    default: "false"
   retrieval_mode:
     description: Agentic retrieval loop. auto lets the reviewer request read_file, grep, and list_references at the PR head before the verdict; off disables it.
     required: false

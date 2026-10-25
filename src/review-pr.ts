@@ -13,6 +13,7 @@ import {
   FailOn,
   LinkedIssue,
   OpenThread,
+  OpenThreadComment,
   ReviewArtifact,
   ReviewComment,
   ReviewOutcome,
@@ -631,19 +632,43 @@ export async function runReviewPr(
         excludedPaths.length > 0 ? excludedPaths : undefined,
       changedFileContext: buildChangedFileContext(
         context.files ?? new Map(),
-        // Derive from the (possibly truncated) diff the model actually sees, so
-        // context never covers hunks absent from the visible diff payload.
-        extractChangedLines(diffText)
+        (() => {
+          const lines = extractChangedLines(diffText);
+          if (context.openThreads && context.openThreads.length > 0) {
+            for (const thread of context.openThreads) {
+              if (thread.path && thread.line > 0) {
+                let lineSet = lines.get(thread.path);
+                if (!lineSet) {
+                  lineSet = new Set<number>();
+                  lines.set(thread.path, lineSet);
+                }
+                lineSet.add(thread.line);
+              }
+            }
+          }
+          return lines;
+        })()
       ),
     });
 
-    const previousSessionId = await loadPreviousReviewSessionId(
-      deps,
-      octokit,
-      owner,
-      repo,
-      prNumber
-    );
+    let reuseReviewSession = false;
+    try {
+      reuseReviewSession = core.getBooleanInput("reuse_review_session", {
+        required: false,
+      });
+    } catch {
+      reuseReviewSession = false;
+    }
+    if (!reuseReviewSession) {
+      const raw = core.getInput("reuse_review_session");
+      if (raw && (raw.toLowerCase() === "true" || raw === "1")) {
+        reuseReviewSession = true;
+      }
+    }
+
+    const previousSessionId = reuseReviewSession
+      ? await loadPreviousReviewSessionId(deps, octokit, owner, repo, prNumber)
+      : undefined;
     const julesOptions = buildJulesReviewOptions(context);
     if (retrievalMode === "auto") {
       julesOptions.retrieval = {
@@ -835,9 +860,14 @@ export async function runReviewPr(
           }
         }
       }
-      const publishableComments = (newComments || []).filter(
-        (c) => !matchesAnyGlob(c.file, ignoreGlobs)
+      const unresolvedThreads = (context.openThreads || []).filter(
+        (t) => !resolvedCommentIds?.includes(t.index)
       );
+      const publishableComments = (newComments || [])
+        .filter((c) => !matchesAnyGlob(c.file, ignoreGlobs))
+        .filter(
+          (c) => !unresolvedThreads.some((t) => findingMatchesThread(c, t))
+        );
       if (publishableComments.length) {
         try {
           await deps.submitReview(
@@ -887,6 +917,10 @@ export async function runReviewPr(
     // Prepare body for the PR review
     const finalBody = `${COMMENT_MARKER}\n## Maxi Review\n\n${summary}\n\n---\n_Session: \`${sessionId}\`_`;
 
+    const unresolvedThreads = (context.openThreads || []).filter(
+      (t) => !resolvedCommentIds?.includes(t.index)
+    );
+
     await deps.submitReview(
       octokit,
       owner,
@@ -895,8 +929,12 @@ export async function runReviewPr(
       headSha,
       finalBody,
       // Never post comments on excluded generated files, even if the model or
-      // an analyzer produced one.
-      (newComments || []).filter((c) => !matchesAnyGlob(c.file, ignoreGlobs))
+      // an analyzer produced one, and do not duplicate open unresolved review threads.
+      (newComments || [])
+        .filter((c) => !matchesAnyGlob(c.file, ignoreGlobs))
+        .filter(
+          (c) => !unresolvedThreads.some((t) => findingMatchesThread(c, t))
+        )
     );
 
     const { state, description } = statusFromVerdict(verdict, failOn);
@@ -985,6 +1023,11 @@ export async function fetchPullRequestContext(input: {
       ? await fetchLinkedIssues(input.octokit, linkedIssueRefs)
       : [];
 
+  const openThreadFiles = openThreads.map((t) => t.path).filter(Boolean);
+  const filesToLoad = Array.from(
+    new Set([...changedFiles, ...openThreadFiles])
+  );
+
   return {
     diff,
     changedFiles,
@@ -994,7 +1037,7 @@ export async function fetchPullRequestContext(input: {
       input.owner,
       input.repo,
       input.headSha,
-      changedFiles
+      filesToLoad
     ),
     changedLines: extractChangedLines(diff),
     rulesFromFile,
@@ -1359,4 +1402,86 @@ function statusFromVerdict(
         state: "success",
         description: `Review complete (verdict: ${verdict})`,
       };
+}
+
+function cleanThreadText(text: string): string {
+  return text
+    .replace(/<!--[\s\S]*?-->/g, " ")
+    .replace(/<details>[\s\S]*?<\/details>/g, " ")
+    .replace(/\*\*severity:\*\*.*?(?=\n|$)/gi, " ")
+    .replace(/\*\*confidence:\*\*.*?(?=\n|$)/gi, " ");
+}
+
+function tokenize(text: string): Set<string> {
+  const words = text
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}_]/gu, " ")
+    .split(/\s+/)
+    .filter((w) => w.length >= 2);
+  return new Set(words);
+}
+
+export function isThreadContentMatch(
+  findingMessage: string,
+  threadBody: string,
+  threadComments?: OpenThreadComment[]
+): boolean {
+  const normFinding = findingMessage.toLowerCase().trim();
+  if (!normFinding) return false;
+
+  const allComments = [threadBody, ...(threadComments ?? []).map((c) => c.body)]
+    .join("\n")
+    .toLowerCase();
+
+  if (allComments.includes(normFinding)) {
+    return true;
+  }
+
+  const cleanedThread = cleanThreadText(allComments);
+  const findingTokens = tokenize(normFinding);
+  if (findingTokens.size === 0) {
+    return allComments.includes(normFinding);
+  }
+
+  const threadTokens = tokenize(cleanedThread);
+  if (threadTokens.size === 0) return false;
+
+  let common = 0;
+  for (const token of findingTokens) {
+    if (threadTokens.has(token)) {
+      common++;
+    }
+  }
+
+  const findingOverlapRatio = common / findingTokens.size;
+  const unionSize = new Set([...findingTokens, ...threadTokens]).size;
+  const jaccard = unionSize > 0 ? common / unionSize : 0;
+
+  return findingOverlapRatio >= 0.5 || jaccard >= 0.4;
+}
+
+/**
+ * Test whether a review finding matches an open unresolved thread.
+ * A finding matches only if path and line match AND the finding content
+ * corresponds to the thread issue (suppressing duplicate findings while
+ * preserving distinct findings on the same line).
+ */
+export function findingMatchesThread(
+  finding: ReviewComment,
+  thread: OpenThread
+): boolean {
+  if (finding.file !== thread.path) {
+    return false;
+  }
+
+  const startLine = finding.startLine ?? finding.line;
+  const endLine = finding.endLine ?? finding.line;
+  const lineMatches =
+    thread.line === finding.line ||
+    (thread.line >= startLine && thread.line <= endLine);
+  if (!lineMatches) {
+    return false;
+  }
+
+  return isThreadContentMatch(finding.message, thread.body, thread.comments);
 }
